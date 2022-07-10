@@ -359,12 +359,11 @@ fail:
 }
 
 static int session_load_devices(Session *s, const char *devices) {
-        const char *p;
         int r = 0;
 
         assert(s);
 
-        for (p = devices;;) {
+        for (const char *p = devices;;) {
                 _cleanup_free_ char *word = NULL;
                 SessionDevice *sd;
                 dev_t dev;
@@ -551,7 +550,7 @@ int session_load(Session *s) {
                         s->class = c;
         }
 
-        if (state && streq(state, "closing"))
+        if (streq_ptr(state, "closing"))
                 s->stopping = true;
 
         if (s->fifo_path) {
@@ -665,12 +664,12 @@ static int session_start_scope(Session *s, sd_bus_message *properties, sd_bus_er
                                 description,
                                 /* These two have StopWhenUnneeded= set, hence add a dep towards them */
                                 STRV_MAKE(s->user->runtime_dir_service,
-                                          s->user->service),
+                                          s->class != SESSION_BACKGROUND ? s->user->service : NULL),
                                 /* And order us after some more */
                                 STRV_MAKE("systemd-logind.service",
                                           "systemd-user-sessions.service",
                                           s->user->runtime_dir_service,
-                                          s->user->service),
+                                          s->class != SESSION_BACKGROUND ? s->user->service : NULL),
                                 user_record_home_directory(s->user->user_record),
                                 properties,
                                 error,
@@ -701,7 +700,7 @@ int session_start(Session *s, sd_bus_message *properties, sd_bus_error *error) {
         if (s->started)
                 return 0;
 
-        r = user_start(s->user);
+        r = user_start(s->user, /* want_user_instance= */ s->class != SESSION_BACKGROUND);
         if (r < 0)
                 return r;
 
@@ -1044,6 +1043,23 @@ void session_set_type(Session *s, SessionType t) {
         session_send_changed(s, "Type", NULL);
 }
 
+int session_set_display(Session *s, const char *display) {
+        int r;
+
+        assert(s);
+        assert(display);
+
+        r = free_and_strdup(&s->display, display);
+        if (r <= 0)  /* 0 means the strings were equal */
+                return r;
+
+        session_save(s);
+
+        session_send_changed(s, "Display", NULL);
+
+        return 1;
+}
+
 static int session_dispatch_fifo(sd_event_source *es, int fd, uint32_t revents, void *userdata) {
         Session *s = userdata;
 
@@ -1313,9 +1329,7 @@ void session_leave_vt(Session *s) {
 }
 
 bool session_is_controller(Session *s, const char *sender) {
-        assert(s);
-
-        return streq_ptr(s->controller, sender);
+        return streq_ptr(ASSERT_PTR(s)->controller, sender);
 }
 
 static void session_release_controller(Session *s, bool notify) {
