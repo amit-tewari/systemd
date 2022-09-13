@@ -67,6 +67,8 @@ int sd_device_new_from_path(sd_device **ret, const char *path);
 int sd_device_new_from_ifname(sd_device **ret, const char *ifname);
 int sd_device_new_from_ifindex(sd_device **ret, int ifindex);
 
+int sd_device_new_child(sd_device **ret, sd_device *device, const char *suffix);
+
 int sd_device_get_parent(sd_device *child, sd_device **ret);
 int sd_device_get_parent_with_subsystem_devtype(sd_device *child, const char *subsystem, const char *devtype, sd_device **ret);
 
@@ -142,6 +144,8 @@ int sd_device_monitor_attach_event(sd_device_monitor *m, sd_event *event);
 int sd_device_monitor_detach_event(sd_device_monitor *m);
 sd_event *sd_device_monitor_get_event(sd_device_monitor *m);
 sd_event_source *sd_device_monitor_get_event_source(sd_device_monitor *m);
+int sd_device_monitor_set_description(sd_device_monitor *m, const char *description);
+int sd_device_monitor_get_description(sd_device_monitor *m, const char **ret);
 int sd_device_monitor_start(sd_device_monitor *m, sd_device_monitor_handler_t callback, void *userdata);
 int sd_device_monitor_stop(sd_device_monitor *m);
 

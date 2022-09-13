@@ -1213,15 +1213,13 @@ static int setup_pam(
 
                 if (getttyname_malloc(STDIN_FILENO, &q) >= 0)
                         tty = strjoina("/dev/", q);
-                else
-                        /* If everything else failed then let's just use value "systemd". This will cause that session
-                         * isn't going to be marked as "background" and user manager will be started. */
-                        tty = "systemd";
         }
 
-        pam_code = pam_set_item(handle, PAM_TTY, tty);
-        if (pam_code != PAM_SUCCESS)
-               goto fail;
+        if (tty) {
+                pam_code = pam_set_item(handle, PAM_TTY, tty);
+                if (pam_code != PAM_SUCCESS)
+                        goto fail;
+        }
 
         STRV_FOREACH(nv, *env) {
                 pam_code = pam_putenv(handle, *nv);
@@ -2748,7 +2746,7 @@ static int load_credential(
                 _cleanup_free_ void *plaintext = NULL;
                 size_t plaintext_size = 0;
 
-                r = decrypt_credential_and_warn(id, now(CLOCK_REALTIME), NULL, data, size, &plaintext, &plaintext_size);
+                r = decrypt_credential_and_warn(id, now(CLOCK_REALTIME), NULL, NULL, data, size, &plaintext, &plaintext_size);
                 if (r < 0)
                         return r;
 
@@ -2922,7 +2920,7 @@ static int acquire_credentials(
                         return log_debug_errno(errno, "Failed to test if credential %s exists: %m", sc->id);
 
                 if (sc->encrypted) {
-                        r = decrypt_credential_and_warn(sc->id, now(CLOCK_REALTIME), NULL, sc->data, sc->size, &plaintext, &size);
+                        r = decrypt_credential_and_warn(sc->id, now(CLOCK_REALTIME), NULL, NULL, sc->data, sc->size, &plaintext, &size);
                         if (r < 0)
                                 return r;
 
@@ -3106,9 +3104,9 @@ static int setup_credentials_internal(
                 /* If we do not have our own mount put used the plain directory fallback, then we need to
                  * open access to the top-level credential directory and the per-service directory now */
 
-                parent = dirname_malloc(final);
-                if (!parent)
-                        return -ENOMEM;
+                r = path_extract_directory(final, &parent);
+                if (r < 0)
+                        return r;
                 if (chmod(parent, 0755) < 0)
                         return -errno;
         }
@@ -3240,6 +3238,7 @@ static int setup_credentials(
 
 #if ENABLE_SMACK
 static int setup_smack(
+                const Manager *manager,
                 const ExecContext *context,
                 int executable_fd) {
         int r;
@@ -3251,20 +3250,17 @@ static int setup_smack(
                 r = mac_smack_apply_pid(0, context->smack_process_label);
                 if (r < 0)
                         return r;
-        }
-#ifdef SMACK_DEFAULT_PROCESS_LABEL
-        else {
+        } else if (manager->default_smack_process_label) {
                 _cleanup_free_ char *exec_label = NULL;
 
                 r = mac_smack_read_fd(executable_fd, SMACK_ATTR_EXEC, &exec_label);
                 if (r < 0 && !IN_SET(r, -ENODATA, -EOPNOTSUPP))
                         return r;
 
-                r = mac_smack_apply_pid(0, exec_label ? : SMACK_DEFAULT_PROCESS_LABEL);
+                r = mac_smack_apply_pid(0, exec_label ? : manager->default_smack_process_label);
                 if (r < 0)
                         return r;
         }
-#endif
 
         return 0;
 }
@@ -4853,7 +4849,7 @@ static int exec_child(
                 /* LSM Smack needs the capability CAP_MAC_ADMIN to change the current execution security context of the
                  * process. This is the latest place before dropping capabilities. Other MAC context are set later. */
                 if (use_smack) {
-                        r = setup_smack(context, executable_fd);
+                        r = setup_smack(unit->manager, context, executable_fd);
                         if (r < 0 && !context->smack_process_label_ignore) {
                                 *exit_status = EXIT_SMACK_PROCESS_LABEL;
                                 return log_unit_error_errno(unit, r, "Failed to set SMACK process label: %m");
@@ -6873,11 +6869,10 @@ int exec_runtime_deserialize_one(Manager *m, const char *value, FDSet *fds) {
         _cleanup_free_ char *tmp_dir = NULL, *var_tmp_dir = NULL;
         char *id = NULL;
         int r, netns_fdpair[] = {-1, -1}, ipcns_fdpair[] = {-1, -1};
-        const char *p, *v = value;
+        const char *p, *v = ASSERT_PTR(value);
         size_t n;
 
         assert(m);
-        assert(value);
         assert(fds);
 
         n = strcspn(v, " ");

@@ -13,6 +13,8 @@ cleanup_test_user() (
     sleep 1
     pkill -KILL -u "$(id -u logind-test-user)"
     userdel -r logind-test-user
+
+    return 0
 )
 
 setup_test_user() {
@@ -83,6 +85,8 @@ teardown_suspend() (
 
     rm -f /run/udev/rules.d/70-logindtest-lid.rules
     udevadm control --reload
+
+    return 0
 )
 
 test_suspend_on_lid() {
@@ -217,13 +221,45 @@ test_shutdown() {
 cleanup_session() (
     set +ex
 
+    local uid s
+
+    uid=$(id -u logind-test-user)
+
+    loginctl disable-linger logind-test-user
+
     systemctl stop getty@tty2.service
+
+    for s in $(loginctl --no-legend list-sessions | awk '$3 == "logind-test-user" { print $1 }'); do
+        echo "INFO: stopping session $s"
+        loginctl terminate-session "$s"
+    done
+
+    loginctl terminate-user logind-test-user
+
+    if ! timeout 30 bash -c "while loginctl --no-legend | grep -q logind-test-user; do sleep 1; done"; then
+        echo "WARNING: session for logind-test-user still active, ignoring."
+    fi
+
+    pkill -u "$uid"
+    sleep 1
+    pkill -KILL -u "$uid"
+
+    if ! timeout 30 bash -c "while systemctl is-active --quiet user@${uid}.service; do sleep 1; done"; then
+        echo "WARNING: user@${uid}.service is still active, ignoring."
+    fi
+
+    if ! timeout 30 bash -c "while systemctl is-active --quiet user-runtime-dir@${uid}.service; do sleep 1; done"; then
+        echo "WARNING: user-runtime-dir@${uid}.service is still active, ignoring."
+    fi
+
+    if ! timeout 30 bash -c "while systemctl is-active --quiet user-${uid}.slice; do sleep 1; done"; then
+        echo "WARNING: user-${uid}.slice is still active, ignoring."
+    fi
+
     rm -rf /run/systemd/system/getty@tty2.service.d
     systemctl daemon-reload
 
-    pkill -u "$(id -u logind-test-user)"
-    sleep 1
-    pkill -KILL -u "$(id -u logind-test-user)"
+    return 0
 )
 
 teardown_session() (
@@ -234,6 +270,8 @@ teardown_session() (
     rm -f /run/udev/rules.d/70-logindtest-scsi_debug-user.rules
     udevadm control --reload
     rmmod scsi_debug
+
+    return 0
 )
 
 check_session() (
@@ -252,7 +290,7 @@ check_session() (
         return 1
     fi
 
-    session=$(loginctl --no-legend | grep "logind-test-user" | awk '{ print $1 }')
+    session=$(loginctl --no-legend | awk '$3 == "logind-test-user" { print $1 }')
     if [[ -z "$session" ]]; then
         echo "no session found for user logind-test-user" >&2
         return 1
@@ -263,7 +301,7 @@ check_session() (
         return 1
     fi
 
-    leader_pid=$(loginctl session-status "$session" | grep "Leader:" | awk '{ print $2 }')
+    leader_pid=$(loginctl session-status "$session" | awk '$1 == "Leader:" { print $2 }')
     if [[ -z "$leader_pid" ]]; then
         echo "cannot found leader process for session $session" >&2
         return 1
@@ -285,6 +323,7 @@ create_session() {
 Type=simple
 ExecStart=
 ExecStart=-/sbin/agetty --autologin logind-test-user --noclear %I $TERM
+Restart=no
 EOF
     systemctl daemon-reload
 
@@ -343,7 +382,7 @@ EOF
     udevadm info "$dev"
 
     # trigger logind and activate session
-    loginctl activate "$(loginctl --no-legend | grep "logind-test-user" | awk '{ print $1 }')"
+    loginctl activate "$(loginctl --no-legend | awk '$3 == "logind-test-user" { print $1 }')"
 
     # check ACL
     sleep 1
@@ -368,10 +407,12 @@ EOF
 teardown_lock_idle_action() (
     set +eux
 
-    cleanup_session
-
     rm -f /run/systemd/logind.conf.d/idle-action-lock.conf
     systemctl restart systemd-logind.service
+
+    cleanup_session
+
+    return 0
 )
 
 test_lock_idle_action() {
@@ -420,46 +461,72 @@ EOF
     fi
 }
 
-teardown_cron() (
-    set +ex
+test_session_properties() {
+    local s
 
-    pkill -u "$(id -u logind-test-user)"
-    sleep 1
-    pkill -KILL -u "$(id -u logind-test-user)"
-    pkill crond
-    crontab -r -u logind-test-user
-)
-
-test_no_user_instance_for_cron() {
-    if ! command -v crond || ! command -v crontab ; then
-        echo "Skipping test for background cron sessions because cron is missing."
+    if [[ ! -c /dev/tty2 ]]; then
+        echo "/dev/tty2 does not exist, skipping test ${FUNCNAME[0]}."
         return
     fi
 
-    trap teardown_cron RETURN
+    trap cleanup_session RETURN
+    create_session
 
-    # Setup cron
-    crond -s -n &
-    # Install crontab for the test user that runs sleep every minute. But let's sleep for
-    # 65 seconds to make sure there is overlap between two consecutive runs, i.e. we have
-    # always a cron session running.
-    crontab -u logind-test-user - <<EOF
-RANDOM_DELAY=0
-* * * * * /bin/sleep 65
+    s=$(loginctl list-sessions --no-legend | awk '$3 == "logind-test-user" { print $1 }')
+    /usr/lib/systemd/tests/manual/test-session-properties "/org/freedesktop/login1/session/_3${s?}"
+}
+
+test_list_users() {
+    if [[ ! -c /dev/tty2 ]]; then
+        echo "/dev/tty2 does not exist, skipping test ${FUNCNAME[0]}."
+        return
+    fi
+
+    trap cleanup_session RETURN
+    create_session
+
+    assert_eq "$(loginctl list-users --no-legend | awk '$2 == "logind-test-user" { print $1 }')" "$(id -ru logind-test-user)"
+    assert_eq "$(loginctl list-users --no-legend | awk '$2 == "logind-test-user" { print $3 }')" no
+
+    loginctl enable-linger logind-test-user
+
+    assert_eq "$(loginctl list-users --no-legend | awk '$2 == "logind-test-user" { print $3 }')" yes
+}
+
+
+teardown_stop_idle_session() (
+    set +eux
+
+    rm -f /run/systemd/logind.conf.d/stop-idle-session.conf
+    systemctl restart systemd-logind.service
+
+    cleanup_session
+)
+
+test_stop_idle_session() {
+    local id ts
+
+    if [[ ! -c /dev/tty2 ]]; then
+        echo "/dev/tty2 does not exist, skipping test ${FUNCNAME[0]}."
+        return
+    fi
+
+    create_session
+    trap teardown_stop_idle_session RETURN
+
+    id="$(loginctl --no-legend | awk '$3 == "logind-test-user" { print $1; }')"
+    ts="$(date '+%H:%M:%S')"
+
+    mkdir -p /run/systemd/logind.conf.d
+    cat >/run/systemd/logind.conf.d/stop-idle-session.conf <<EOF
+[Login]
+StopIdleSessionSec=2s
 EOF
+    systemctl restart systemd-logind.service
+    sleep 5
 
-    # Let's wait (at most one interval plus 10s to accommodate for slow machines) for at least one session
-    # of the test user
-    timeout 70 bash -c "while ! loginctl --no-legend list-sessions | grep -q logind-test-user; do sleep 1; done"
-
-    # Check that all sessions of test user have class=background and no user instance was started
-    # for the test user.
-    while read -r s _; do
-        assert_eq "$(loginctl --property Class --value show-session "$s")" "background"
-    done < <(loginctl --no-legend list-sessions | grep logind-test-user)
-
-    assert_eq "$(systemctl --property ActiveState --value show user@"$(id -u logind-test-user)".service)" "inactive"
-    assert_eq "$(systemctl --property SubState --value show user@"$(id -u logind-test-user)".service)" "dead"
+    assert_eq "$(journalctl -b -u systemd-logind.service --since="$ts" --grep "Session \"$id\" of user \"logind-test-user\" is idle, stopping." | wc -l)" 1
+    assert_eq "$(loginctl --no-legend | grep -c "logind-test-user")" 0
 }
 
 : >/failed
@@ -472,7 +539,9 @@ test_suspend_on_lid
 test_shutdown
 test_session
 test_lock_idle_action
-test_no_user_instance_for_cron
+test_session_properties
+test_list_users
+test_stop_idle_session
 
 touch /testok
 rm /failed

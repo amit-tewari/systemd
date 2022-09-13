@@ -12,6 +12,7 @@
 #include "networkd-dhcp-server.h"
 #include "networkd-ipv4acd.h"
 #include "networkd-manager.h"
+#include "networkd-netlabel.h"
 #include "networkd-network.h"
 #include "networkd-queue.h"
 #include "networkd-route-util.h"
@@ -137,19 +138,20 @@ Address *address_free(Address *address) {
 
         config_section_free(address->section);
         free(address->label);
+        free(address->netlabel);
         return mfree(address);
 }
 
 bool address_is_ready(const Address *a) {
         assert(a);
 
+        if (!ipv4acd_bound(a))
+                return false;
+
         if (FLAGS_SET(a->flags, IFA_F_TENTATIVE))
                 return false;
 
         if (FLAGS_SET(a->state, NETWORK_CONFIG_STATE_REMOVING))
-                return false;
-
-        if (FLAGS_SET(a->state, NETWORK_CONFIG_STATE_PROBING))
                 return false;
 
         if (!FLAGS_SET(a->state, NETWORK_CONFIG_STATE_CONFIGURED))
@@ -212,39 +214,32 @@ void address_set_broadcast(Address *a, Link *link) {
         a->broadcast.s_addr = a->in_addr.in.s_addr | htobe32(UINT32_C(0xffffffff) >> a->prefixlen);
 }
 
-static struct ifa_cacheinfo *address_set_cinfo(const Address *a, struct ifa_cacheinfo *cinfo) {
+static void address_set_cinfo(Manager *m, const Address *a, struct ifa_cacheinfo *cinfo) {
         usec_t now_usec;
 
+        assert(m);
         assert(a);
         assert(cinfo);
 
-        now_usec = now(CLOCK_BOOTTIME);
+        assert_se(sd_event_now(m->event, CLOCK_BOOTTIME, &now_usec) >= 0);
 
         *cinfo = (struct ifa_cacheinfo) {
-                .ifa_valid = MIN(usec_sub_unsigned(a->lifetime_valid_usec, now_usec) / USEC_PER_SEC, UINT32_MAX),
-                .ifa_prefered = MIN(usec_sub_unsigned(a->lifetime_preferred_usec, now_usec) / USEC_PER_SEC, UINT32_MAX),
+                .ifa_valid = usec_to_sec(a->lifetime_valid_usec, now_usec),
+                .ifa_prefered = usec_to_sec(a->lifetime_preferred_usec, now_usec),
         };
-
-        return cinfo;
 }
 
-static void address_set_lifetime(Address *a, const struct ifa_cacheinfo *cinfo) {
+static void address_set_lifetime(Manager *m, Address *a, const struct ifa_cacheinfo *cinfo) {
         usec_t now_usec;
 
+        assert(m);
         assert(a);
         assert(cinfo);
 
-        now_usec = now(CLOCK_BOOTTIME);
+        assert_se(sd_event_now(m->event, CLOCK_BOOTTIME, &now_usec) >= 0);
 
-        if (cinfo->ifa_valid == UINT32_MAX)
-                a->lifetime_valid_usec = USEC_INFINITY;
-        else
-                a->lifetime_valid_usec = usec_add(cinfo->ifa_valid * USEC_PER_SEC, now_usec);
-
-        if (cinfo->ifa_prefered == UINT32_MAX)
-                a->lifetime_preferred_usec = USEC_INFINITY;
-        else
-                a->lifetime_preferred_usec = usec_add(cinfo->ifa_prefered * USEC_PER_SEC, now_usec);
+        a->lifetime_valid_usec = sec_to_usec(cinfo->ifa_valid, now_usec);
+        a->lifetime_preferred_usec = sec_to_usec(cinfo->ifa_prefered, now_usec);
 }
 
 static uint32_t address_prefix(const Address *a) {
@@ -399,12 +394,17 @@ int address_dup(const Address *src, Address **ret) {
         dest->link = NULL;
         dest->label = NULL;
         dest->acd = NULL;
+        dest->netlabel = NULL;
 
         if (src->family == AF_INET) {
                 r = free_and_strdup(&dest->label, src->label);
                 if (r < 0)
                         return r;
         }
+
+        r = free_and_strdup(&dest->netlabel, src->netlabel);
+        if (r < 0)
+                return r;
 
         *ret = TAKE_PTR(dest);
         return 0;
@@ -492,6 +492,8 @@ static int address_update(Address *address) {
         if (r < 0)
                 return log_link_warning_errno(link, r, "Could not enable IP masquerading: %m");
 
+        address_add_netlabel(address);
+
         if (address_is_ready(address) && address->callback) {
                 r = address->callback(address);
                 if (r < 0)
@@ -517,6 +519,8 @@ static int address_drop(Address *address) {
         r = address_set_masquerade(address, false);
         if (r < 0)
                 log_link_warning_errno(link, r, "Failed to disable IP masquerading, ignoring: %m");
+
+        address_del_netlabel(address);
 
         if (address->state == 0)
                 address_free(address);
@@ -809,14 +813,14 @@ int link_drop_ipv6ll_addresses(Link *link) {
         /* IPv6LL address may be in the tentative state, and in that case networkd has not received it.
          * So, we need to dump all IPv6 addresses. */
 
-        if (link_may_have_ipv6ll(link))
+        if (link_may_have_ipv6ll(link, /* check_multicast = */ false))
                 return 0;
 
         r = sd_rtnl_message_new_addr(link->manager->rtnl, &req, RTM_GETADDR, link->ifindex, AF_INET6);
         if (r < 0)
                 return r;
 
-        r = sd_netlink_message_request_dump(req, true);
+        r = sd_netlink_message_set_request_dump(req, true);
         if (r < 0)
                 return r;
 
@@ -1035,12 +1039,13 @@ int address_configure_handler_internal(sd_netlink *rtnl, sd_netlink_message *m, 
         return 1;
 }
 
-static int address_configure(const Address *address, Link *link, Request *req) {
+static int address_configure(const Address *address, const struct ifa_cacheinfo *c, Link *link, Request *req) {
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
         int r;
 
         assert(address);
         assert(IN_SET(address->family, AF_INET, AF_INET6));
+        assert(c);
         assert(link);
         assert(link->ifindex > 0);
         assert(link->manager);
@@ -1077,8 +1082,7 @@ static int address_configure(const Address *address, Link *link, Request *req) {
                         return r;
         }
 
-        r = sd_netlink_message_append_cache_info(m, IFA_CACHEINFO,
-                                                 address_set_cinfo(address, &(struct ifa_cacheinfo) {}));
+        r = sd_netlink_message_append_cache_info(m, IFA_CACHEINFO, c);
         if (r < 0)
                 return r;
 
@@ -1096,7 +1100,7 @@ static bool address_is_ready_to_configure(Link *link, const Address *address) {
         if (!link_is_ready_to_configure(link, false))
                 return false;
 
-        if (FLAGS_SET(address->state, NETWORK_CONFIG_STATE_PROBING))
+        if (!ipv4acd_bound(address))
                 return false;
 
         /* Refuse adding more than the limit */
@@ -1107,6 +1111,7 @@ static bool address_is_ready_to_configure(Link *link, const Address *address) {
 }
 
 static int address_process_request(Request *req, Link *link, Address *address) {
+        struct ifa_cacheinfo c;
         int r;
 
         assert(req);
@@ -1116,7 +1121,16 @@ static int address_process_request(Request *req, Link *link, Address *address) {
         if (!address_is_ready_to_configure(link, address))
                 return 0;
 
-        r = address_configure(address, link, req);
+        address_set_cinfo(link->manager, address, &c);
+        if (c.ifa_valid == 0) {
+                log_link_debug(link, "Refuse to configure %s address %s, as its valid lifetime is zero.",
+                               network_config_source_to_string(address->source),
+                               IN_ADDR_PREFIX_TO_STRING(address->family, &address->in_addr, address->prefixlen));
+                address_cancel_requesting(address);
+                return 1;
+        }
+
+        r = address_configure(address, &c, link, req);
         if (r < 0)
                 return log_link_warning_errno(link, r, "Failed to configure address: %m");
 
@@ -1187,6 +1201,7 @@ int link_request_address(
         } else {
                 existing->source = address->source;
                 existing->provider = address->provider;
+                existing->duplicate_address_detection = address->duplicate_address_detection;
                 existing->lifetime_valid_usec = address->lifetime_valid_usec;
                 existing->lifetime_preferred_usec = address->lifetime_preferred_usec;
                 if (consume_object)
@@ -1455,18 +1470,18 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
                         /* update flags and etc. */
                         address->flags = tmp->flags;
                         address->scope = tmp->scope;
-                        address_set_lifetime(address, &cinfo);
+                        address_set_lifetime(m, address, &cinfo);
                         address_enter_configured(address);
                         log_address_debug(address, "Received updated", link);
                 } else {
-                        address_set_lifetime(tmp, &cinfo);
+                        address_set_lifetime(m, tmp, &cinfo);
                         address_enter_configured(tmp);
                         log_address_debug(tmp, "Received new", link);
 
                         r = address_add(link, tmp);
                         if (r < 0) {
                                 log_link_warning_errno(link, r, "Failed to remember foreign address %s, ignoring: %m",
-                                                       IN_ADDR_PREFIX_TO_STRING(tmp->family, &tmp->in_addr, tmp->prefixlen));                
+                                                       IN_ADDR_PREFIX_TO_STRING(tmp->family, &tmp->in_addr, tmp->prefixlen));
                                 return 0;
                         }
 
@@ -1932,6 +1947,47 @@ int config_parse_duplicate_address_detection(
                 return 0;
         }
         n->duplicate_address_detection = a;
+
+        TAKE_PTR(n);
+        return 0;
+}
+
+int config_parse_address_netlabel(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        Network *network = userdata;
+        _cleanup_(address_free_or_set_invalidp) Address *n = NULL;
+        int r;
+
+        assert(filename);
+        assert(section);
+        assert(lvalue);
+        assert(rvalue);
+        assert(data);
+        assert(network);
+
+        r = address_new_static(network, filename, section_line, &n);
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to allocate new address, ignoring assignment: %m");
+                return 0;
+        }
+
+        r = config_parse_string(unit, filename, line, section, section_line,
+                                lvalue, CONFIG_PARSE_STRING_SAFE, rvalue, &n->netlabel, network);
+        if (r < 0)
+                return r;
 
         TAKE_PTR(n);
         return 0;

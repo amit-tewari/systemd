@@ -360,7 +360,7 @@
           not</emphasis> provided.</para>
 
           <para>For example, <literal>SUPPORT_END=2001-01-01</literal> means that the system was supported
-          until the end of the last day of the previous millenium.</para></listitem>
+          until the end of the last day of the previous millennium.</para></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -412,6 +412,18 @@
         </varlistentry>
 
         <varlistentry>
+          <term><varname>ARCHITECTURE=</varname></term>
+          <listitem><para>A string that specifies which CPU architecture the userspace binaries require.
+          The architecture identifiers are the same as for <varname>ConditionArchitecture=</varname>
+          described in <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+          The field is optional and should only be used when just single architecture is supported.
+          It may provide redundant information when used in a GPT partition with a GUID type that already
+          encodes the architecture. If this is not the case, the architecture should be specified in
+          e.g., an extension image, to prevent an incompatible host from loading it.
+          </para></listitem>
+        </varlistentry>
+
+        <varlistentry>
           <term><varname>SYSEXT_LEVEL=</varname></term>
 
           <listitem><para>A lower-case string (mostly numeric, no spaces or other characters outside of 0–9,
@@ -442,7 +454,7 @@
           <listitem><para>Takes a space-separated list of one or more valid prefix match strings for the
           <ulink url="https://systemd.io/PORTABLE_SERVICES">Portable Services</ulink> logic. This field
           serves two purposes: it is informational, identifying portable service images as such (and thus
-          allowing them to be distinguished from other OS images, such as bootable system images). In is also
+          allowing them to be distinguished from other OS images, such as bootable system images). It is also
           used when a portable service image is attached: the specified or implied portable service prefix is
           checked against the list specified here, to enforce restrictions how images may be attached to a
           system.</para></listitem>

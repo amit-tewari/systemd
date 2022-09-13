@@ -58,7 +58,7 @@ struct DnsCacheItem {
 
 /* Returns true if this is a cache item created as result of an explicit lookup, or created as "side-effect"
  * of another request. "Primary" entries will carry the full answer data (with NSEC, …) that can aso prove
- * wildcard expansion, non-existance and such, while entries that were created as "side-effect" just contain
+ * wildcard expansion, non-existence and such, while entries that were created as "side-effect" just contain
  * immediate RR data for the specified RR key, but nothing else. */
 #define DNS_CACHE_ITEM_IS_PRIMARY(item) (!!(item)->answer)
 
@@ -1242,16 +1242,14 @@ int dns_cache_check_conflicts(DnsCache *cache, DnsResourceRecord *rr, int owner_
         return 1;
 }
 
-int dns_cache_export_shared_to_packet(DnsCache *cache, DnsPacket *p) {
+int dns_cache_export_shared_to_packet(DnsCache *cache, DnsPacket *p, usec_t ts, unsigned max_rr) {
         unsigned ancount = 0;
         DnsCacheItem *i;
-        usec_t t;
         int r;
 
         assert(cache);
         assert(p);
-
-        t = now(CLOCK_BOOTTIME);
+        assert(p->protocol == DNS_PROTOCOL_MDNS);
 
         HASHMAP_FOREACH(i, cache->by_key)
                 LIST_FOREACH(by_key, j, i) {
@@ -1263,14 +1261,17 @@ int dns_cache_export_shared_to_packet(DnsCache *cache, DnsPacket *p) {
 
                         /* RFC6762 7.1: Don't append records with less than half the TTL remaining
                          * as known answers. */
-                        if (usec_sub_unsigned(j->until, t) < j->rr->ttl * USEC_PER_SEC / 2)
+                        if (usec_sub_unsigned(j->until, ts) < j->rr->ttl * USEC_PER_SEC / 2)
                                 continue;
 
                         r = dns_packet_append_rr(p, j->rr, 0, NULL, NULL);
-                        if (r == -EMSGSIZE && p->protocol == DNS_PROTOCOL_MDNS) {
-                                /* For mDNS, if we're unable to stuff all known answers into the given packet,
-                                 * allocate a new one, push the RR into that one and link it to the current one.
-                                 */
+                        if (r == -EMSGSIZE) {
+                                if (max_rr == 0)
+                                        /* If max_rr == 0, do not allocate more packets. */
+                                        goto finalize;
+
+                                /* If we're unable to stuff all known answers into the given packet, allocate
+                                 * a new one, push the RR into that one and link it to the current one. */
 
                                 DNS_PACKET_HEADER(p)->ancount = htobe16(ancount);
                                 ancount = 0;
@@ -1288,8 +1289,21 @@ int dns_cache_export_shared_to_packet(DnsCache *cache, DnsPacket *p) {
                                 return r;
 
                         ancount++;
+                        if (max_rr > 0 && ancount >= max_rr) {
+                                DNS_PACKET_HEADER(p)->ancount = htobe16(ancount);
+                                ancount = 0;
+
+                                r = dns_packet_new_query(&p->more, p->protocol, 0, true);
+                                if (r < 0)
+                                        return r;
+
+                                p = p->more;
+
+                                max_rr = UINT_MAX;
+                        }
                 }
 
+finalize:
         DNS_PACKET_HEADER(p)->ancount = htobe16(ancount);
 
         return 0;

@@ -2,6 +2,9 @@
 
 #include <efi.h>
 #include <efilib.h>
+#if defined(__i386__) || defined(__x86_64__)
+#  include <cpuid.h>
+#endif
 
 #include "ticks.h"
 #include "util.h"
@@ -241,7 +244,7 @@ void efivar_set_time_usec(const EFI_GUID *vendor, const char16_t *name, uint64_t
         efivar_set(vendor, name, str, 0);
 }
 
-static INTN utf8_to_16(const char *stra, char16_t *c) {
+static int utf8_to_16(const char *stra, char16_t *c) {
         char16_t unichar;
         UINTN len;
 
@@ -309,7 +312,7 @@ char16_t *xstra_to_str(const char *stra) {
         strlen = 0;
         i = 0;
         while (i < len) {
-                INTN utf8len;
+                int utf8len;
 
                 utf8len = utf8_to_16(stra + i, str + strlen);
                 if (utf8len <= 0) {
@@ -340,7 +343,7 @@ char16_t *xstra_to_path(const char *stra) {
         strlen = 1;
         i = 0;
         while (i < len) {
-                INTN utf8len;
+                int utf8len;
 
                 utf8len = utf8_to_16(stra + i, str + strlen);
                 if (utf8len <= 0) {
@@ -378,7 +381,7 @@ EFI_STATUS file_read(EFI_FILE *dir, const char16_t *name, UINTN off, UINTN size,
                 return err;
 
         if (size == 0) {
-                _cleanup_freepool_ EFI_FILE_INFO *info = NULL;
+                _cleanup_free_ EFI_FILE_INFO *info = NULL;
 
                 err = get_file_info_harder(handle, &info, NULL);
                 if (err != EFI_SUCCESS)
@@ -483,7 +486,7 @@ EFI_STATUS get_file_info_harder(
                 UINTN *ret_size) {
 
         UINTN size = offsetof(EFI_FILE_INFO, FileName) + 256;
-        _cleanup_freepool_ EFI_FILE_INFO *fi = NULL;
+        _cleanup_free_ EFI_FILE_INFO *fi = NULL;
         EFI_STATUS err;
 
         assert(handle);
@@ -585,7 +588,7 @@ EFI_STATUS open_directory(
                 EFI_FILE **ret) {
 
         _cleanup_(file_closep) EFI_FILE *dir = NULL;
-        _cleanup_freepool_ EFI_FILE_INFO *file_info = NULL;
+        _cleanup_free_ EFI_FILE_INFO *file_info = NULL;
         EFI_STATUS err;
 
         assert(root);
@@ -634,6 +637,31 @@ __attribute__((noinline)) void debug_break(void) {
 #else
                 BS->Stall(5000);
 #endif
+}
+#endif
+
+
+#ifdef EFI_DEBUG
+void hexdump(const char16_t *prefix, const void *data, UINTN size) {
+        static const char hex[16] = "0123456789abcdef";
+        _cleanup_free_ char16_t *buf = NULL;
+        const uint8_t *d = data;
+
+        assert(prefix);
+        assert(data || size == 0);
+
+        /* Debugging helper — please keep this around, even if not used */
+
+        buf = xnew(char16_t, size*2+1);
+
+        for (UINTN i = 0; i < size; i++) {
+                buf[i*2] = hex[d[i] >> 4];
+                buf[i*2+1] = hex[d[i] & 0x0F];
+        }
+
+        buf[size*2] = 0;
+
+        log_error_stall(L"%s[%" PRIuN "]: %s", prefix, size, buf);
 }
 #endif
 
@@ -723,23 +751,34 @@ EFI_STATUS make_file_device_path(EFI_HANDLE device, const char16_t *file, EFI_DE
                 end_node = NextDevicePathNode(end_node);
 
         size_t file_size = strsize16(file);
-        size_t dp_size = ((uint8_t *) end_node - (uint8_t *) dp) + END_DEVICE_PATH_LENGTH;
+        size_t dp_size = (uint8_t *) end_node - (uint8_t *) dp;
 
         /* Make a copy that can also hold a file media device path. */
-        *ret_dp = xmalloc(dp_size + file_size + SIZE_OF_FILEPATH_DEVICE_PATH);
-        memcpy(*ret_dp, dp, dp_size);
+        *ret_dp = xmalloc(dp_size + file_size + SIZE_OF_FILEPATH_DEVICE_PATH + END_DEVICE_PATH_LENGTH);
+        dp = mempcpy(*ret_dp, dp, dp_size);
 
-        /* Point dp to the end node of the copied device path. */
-        dp = (EFI_DEVICE_PATH *) ((uint8_t *) *ret_dp + dp_size - END_DEVICE_PATH_LENGTH);
-
-        /* Replace end node with file media device path. */
-        FILEPATH_DEVICE_PATH *file_dp = (FILEPATH_DEVICE_PATH *) dp;
-        file_dp->Header.Type = MEDIA_DEVICE_PATH;
-        file_dp->Header.SubType = MEDIA_FILEPATH_DP;
-        memcpy(&file_dp->PathName, file, file_size);
-        SetDevicePathNodeLength(&file_dp->Header, SIZE_OF_FILEPATH_DEVICE_PATH + file_size);
+        /* Replace end node with file media device path. Use memcpy() in case dp is unaligned (if accessed as
+         * FILEPATH_DEVICE_PATH). */
+        dp->Type = MEDIA_DEVICE_PATH;
+        dp->SubType = MEDIA_FILEPATH_DP;
+        memcpy((uint8_t *) dp + offsetof(FILEPATH_DEVICE_PATH, PathName), file, file_size);
+        SetDevicePathNodeLength(dp, offsetof(FILEPATH_DEVICE_PATH, PathName) + file_size);
 
         dp = NextDevicePathNode(dp);
         SetDevicePathEndNode(dp);
         return EFI_SUCCESS;
 }
+
+#if defined(__i386__) || defined(__x86_64__)
+bool in_hypervisor(void) {
+        uint32_t eax, ebx, ecx, edx;
+
+        /* This is a dumbed down version of src/basic/virt.c's detect_vm() that safely works in the UEFI
+         * environment. */
+
+        if (__get_cpuid(1, &eax, &ebx, &ecx, &edx) == 0)
+                return false;
+
+        return !!(ecx & 0x80000000U);
+}
+#endif

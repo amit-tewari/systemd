@@ -27,7 +27,6 @@
 #include "format-util.h"
 #include "fs-util.h"
 #include "glyph-util.h"
-#include "ipvlan.h"
 #include "missing_network.h"
 #include "netlink-util.h"
 #include "network-internal.h"
@@ -65,45 +64,10 @@
 #include "strv.h"
 #include "tc.h"
 #include "tmpfile-util.h"
+#include "tuntap.h"
 #include "udev-util.h"
 #include "util.h"
 #include "vrf.h"
-
-bool link_ipv4ll_enabled(Link *link) {
-        assert(link);
-
-        if (link->flags & IFF_LOOPBACK)
-                return false;
-
-        if (!link->network)
-                return false;
-
-        if (link->iftype == ARPHRD_CAN)
-                return false;
-
-        if (link->hw_addr.length != ETH_ALEN)
-                return false;
-
-        if (ether_addr_is_null(&link->hw_addr.ether))
-                return false;
-
-        /* ARPHRD_INFINIBAND seems to potentially support IPv4LL.
-         * But currently sd-ipv4ll and sd-ipv4acd only support ARPHRD_ETHER. */
-        if (link->iftype != ARPHRD_ETHER)
-                return false;
-
-        if (streq_ptr(link->kind, "vrf"))
-                return false;
-
-        /* L3 or L3S mode do not support ARP. */
-        if (IN_SET(link_get_ipvlan_mode(link), NETDEV_IPVLAN_MODE_L3, NETDEV_IPVLAN_MODE_L3S))
-                return false;
-
-        if (link->network->bond)
-                return false;
-
-        return link->network->link_local & ADDRESS_FAMILY_IPV4;
-}
 
 bool link_ipv6_enabled(Link *link) {
         assert(link);
@@ -111,14 +75,16 @@ bool link_ipv6_enabled(Link *link) {
         if (!socket_ipv6_is_supported())
                 return false;
 
-        if (link->network->bond)
-                return false;
-
         if (link->iftype == ARPHRD_CAN)
                 return false;
 
-        /* DHCPv6 client will not be started if no IPv6 link-local address is configured. */
-        if (link_ipv6ll_enabled(link))
+        if (!link->network)
+                return false;
+
+        if (link->network->bond)
+                return false;
+
+        if (link_may_have_ipv6ll(link, /* check_multicast = */ false))
                 return true;
 
         if (network_has_static_ipv6_configurations(link->network))
@@ -127,18 +93,14 @@ bool link_ipv6_enabled(Link *link) {
         return false;
 }
 
-bool link_is_ready_to_configure(Link *link, bool allow_unmanaged) {
+static bool link_is_ready_to_configure_one(Link *link, bool allow_unmanaged) {
         assert(link);
 
-        if (!link->network) {
-                if (!allow_unmanaged)
-                        return false;
-
-                return link_has_carrier(link);
-        }
-
-        if (!IN_SET(link->state, LINK_STATE_CONFIGURING, LINK_STATE_CONFIGURED))
+        if (!IN_SET(link->state, LINK_STATE_CONFIGURING, LINK_STATE_CONFIGURED, LINK_STATE_UNMANAGED))
                 return false;
+
+        if (!link->network)
+                return allow_unmanaged;
 
         if (!link->network->configure_without_carrier) {
                 if (link->set_flags_messages > 0)
@@ -155,6 +117,10 @@ bool link_is_ready_to_configure(Link *link, bool allow_unmanaged) {
                 return false;
 
         return true;
+}
+
+bool link_is_ready_to_configure(Link *link, bool allow_unmanaged) {
+        return check_ready_for_all_sr_iov_ports(link, allow_unmanaged, link_is_ready_to_configure_one);
 }
 
 void link_ntp_settings_clear(Link *link) {
@@ -218,6 +184,7 @@ static Link *link_free(Link *link) {
 
         link_free_engines(link);
 
+        set_free(link->sr_iov_virt_port_ifindices);
         free(link->ifname);
         strv_free(link->alternative_names);
         free(link->kind);
@@ -229,7 +196,7 @@ static Link *link_free(Link *link) {
         unlink_and_free(link->lldp_file);
         unlink_and_free(link->state_file);
 
-        sd_device_unref(link->sd_device);
+        sd_device_unref(link->dev);
         netdev_unref(link->netdev);
 
         hashmap_free(link->bound_to_links);
@@ -611,6 +578,12 @@ static int link_acquire_dynamic_ipv4_conf(Link *link) {
                 log_link_debug(link, "Acquiring DHCPv4 lease.");
 
         } else if (link->ipv4ll) {
+                if (in4_addr_is_set(&link->network->ipv4ll_start_address)) {
+                        r = sd_ipv4ll_set_address(link->ipv4ll, &link->network->ipv4ll_start_address);
+                        if (r < 0)
+                                return log_link_warning_errno(link, r, "Could not set IPv4 link-local start address: %m");
+                }
+
                 r = sd_ipv4ll_start(link->ipv4ll);
                 if (r < 0)
                         return log_link_warning_errno(link, r, "Could not acquire IPv4 link-local address: %m");
@@ -923,6 +896,8 @@ static Link *link_drop(Link *link) {
         link_free_bound_to_list(link);
         link_free_bound_by_list(link);
 
+        link_clear_sr_iov_ifindices(link);
+
         link_drop_from_master(link);
 
         if (link->state_file)
@@ -1158,7 +1133,7 @@ static int link_get_network(Link *link, Network **ret) {
 
                 r = net_match_config(
                                 &network->match,
-                                link->sd_device,
+                                link->dev,
                                 &link->hw_addr,
                                 &link->permanent_hw_addr,
                                 link->driver,
@@ -1174,11 +1149,11 @@ static int link_get_network(Link *link, Network **ret) {
                 if (r == 0)
                         continue;
 
-                if (network->match.ifname && link->sd_device) {
+                if (network->match.ifname && link->dev) {
                         uint8_t name_assign_type = NET_NAME_UNKNOWN;
                         const char *attr;
 
-                        if (sd_device_get_sysattr_value(link->sd_device, "name_assign_type", &attr) >= 0)
+                        if (sd_device_get_sysattr_value(link->dev, "name_assign_type", &attr) >= 0)
                                 (void) safe_atou8(attr, &name_assign_type);
 
                         warn = name_assign_type == NET_NAME_ENUM;
@@ -1422,14 +1397,18 @@ static int link_initialized_handler(sd_netlink *rtnl, sd_netlink_message *m, Lin
 }
 
 static int link_initialized(Link *link, sd_device *device) {
+        int r;
+
         assert(link);
         assert(device);
 
         /* Always replace with the new sd_device object. As the sysname (and possibly other properties
          * or sysattrs) may be outdated. */
-        sd_device_ref(device);
-        sd_device_unref(link->sd_device);
-        link->sd_device = device;
+        device_unref_and_replace(link->dev, device);
+
+        r = link_set_sr_iov_ifindices(link);
+        if (r < 0)
+                log_link_warning_errno(link, r, "Failed to manage SR-IOV PF and VF ports, ignoring: %m");
 
         /* Do not ignore unamanaged state case here. If an interface is renamed after being once
          * configured, and the corresponding .network file has Name= in [Match] section, then the
@@ -1484,48 +1463,39 @@ static int link_check_initialized(Link *link) {
         return link_initialized(link, device);
 }
 
-int manager_udev_process_link(sd_device_monitor *monitor, sd_device *device, void *userdata) {
-        sd_device_action_t action;
-        Manager *m = userdata;
-        Link *link = NULL;
+int manager_udev_process_link(Manager *m, sd_device *device, sd_device_action_t action) {
         int r, ifindex;
+        Link *link;
 
         assert(m);
         assert(device);
 
-        r = sd_device_get_action(device, &action);
+        r = sd_device_get_ifindex(device, &ifindex);
+        if (r < 0)
+                return log_device_debug_errno(device, r, "Failed to get ifindex: %m");
+
+        r = link_get_by_index(m, ifindex, &link);
         if (r < 0) {
-                log_device_debug_errno(device, r, "Failed to get udev action, ignoring device: %m");
+                /* This error is not critical, as the corresponding rtnl message may be received later. */
+                log_device_debug_errno(device, r, "Failed to get link from ifindex %i, ignoring: %m", ifindex);
                 return 0;
         }
 
-        /* Ignore the "remove" uevent — let's remove a device only if rtnetlink says so. All other uevents
-         * are "positive" events in some form, i.e. inform us about a changed or new network interface, that
-         * still exists — and we are interested in that. */
-        if (action == SD_DEVICE_REMOVE)
-                return 0;
-
-        r = sd_device_get_ifindex(device, &ifindex);
-        if (r < 0) {
-                log_device_debug_errno(device, r, "Ignoring udev %s event for device without ifindex or with invalid ifindex: %m",
-                                       device_action_to_string(action));
+        /* Let's unref the sd-device object assigned to the corresponding Link object, but keep the Link
+         * object here. It will be removed only when rtnetlink says so. */
+        if (action == SD_DEVICE_REMOVE) {
+                link->dev = sd_device_unref(link->dev);
                 return 0;
         }
 
         r = device_is_renaming(device);
-        if (r < 0) {
-                log_device_debug_errno(device, r, "Failed to determine the device is renamed or not, ignoring '%s' uevent: %m",
-                                       device_action_to_string(action));
-                return 0;
-        }
+        if (r < 0)
+                return log_device_debug_errno(device, r, "Failed to determine if the device is renaming or not: %m");
         if (r > 0) {
-                log_device_debug(device, "Interface is under renaming, wait for the interface to be renamed.");
-                return 0;
-        }
-
-        r = link_get_by_index(m, ifindex, &link);
-        if (r < 0) {
-                log_device_debug_errno(device, r, "Failed to get link from ifindex %i, ignoring: %m", ifindex);
+                log_device_debug(device, "Device is renaming, waiting for the interface to be renamed.");
+                /* TODO:
+                 * What happens when a device is initialized, then soon renamed after that? When we detect
+                 * such, maybe we should cancel or postpone all queued requests for the interface. */
                 return 0;
         }
 
@@ -1619,10 +1589,8 @@ static int link_carrier_lost_impl(Link *link) {
 }
 
 static int link_carrier_lost_handler(sd_event_source *s, uint64_t usec, void *userdata) {
-        Link *link = userdata;
+        Link *link = ASSERT_PTR(userdata);
         int r;
-
-        assert(link);
 
         r = link_carrier_lost_impl(link);
         if (r < 0) {
@@ -2192,7 +2160,7 @@ static int link_update_hardware_address(Link *link, sd_netlink_message *message)
         if (r < 0)
                 return log_link_debug_errno(link, r, "Could not update MAC address for Router Advertisement: %m");
 
-        if (link->ndisc) {
+        if (link->ndisc && link->hw_addr.length == ETH_ALEN) {
                 r = sd_ndisc_set_mac(link->ndisc, &link->hw_addr.ether);
                 if (r < 0)
                         return log_link_debug_errno(link, r, "Could not update MAC for NDisc: %m");

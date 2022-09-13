@@ -25,6 +25,7 @@
 #include "chattr-util.h"
 #include "conf-files.h"
 #include "copy.h"
+#include "creds-util.h"
 #include "def.h"
 #include "devnum-util.h"
 #include "dirent-util.h"
@@ -36,6 +37,7 @@
 #include "format-util.h"
 #include "fs-util.h"
 #include "glob-util.h"
+#include "hexdecoct.h"
 #include "io-util.h"
 #include "label.h"
 #include "log.h"
@@ -127,6 +129,8 @@ typedef struct Item {
 
         char *path;
         char *argument;
+        void *binary_argument;        /* set if binary data, in which case it takes precedence over 'argument' */
+        size_t binary_argument_size;
         char **xattrs;
 #if HAVE_ACL
         acl_t acl_access;
@@ -459,6 +463,17 @@ static bool unix_socket_alive(const char *fn) {
                 return true;     /* We don't know, so assume yes */
 
         return set_contains(unix_sockets, fn);
+}
+
+/* Accessors for the argument in binary format */
+static const void* item_binary_argument(const Item *i) {
+        assert(i);
+        return i->binary_argument ?: i->argument;
+}
+
+static size_t item_binary_argument_size(const Item *i) {
+        assert(i);
+        return i->binary_argument ? i->binary_argument_size : strlen_ptr(i->argument);
 }
 
 static DIR* xopendirat_nomod(int dirfd, const char *path) {
@@ -985,10 +1000,8 @@ static int parse_xattrs_from_arg(Item *i) {
         int r;
 
         assert(i);
-        assert(i->argument);
 
-        p = i->argument;
-
+        assert_se(p = i->argument);
         for (;;) {
                 _cleanup_free_ char *name = NULL, *value = NULL, *xattr = NULL;
 
@@ -1329,6 +1342,27 @@ static int path_set_attribute(Item *item, const char *path) {
         return fd_set_attribute(item, fd, path, NULL);
 }
 
+static int write_argument_data(Item *i, int fd, const char *path) {
+        int r;
+
+        assert(i);
+        assert(fd >= 0);
+        assert(path);
+
+        if (item_binary_argument_size(i) == 0)
+                return 0;
+
+        assert(item_binary_argument(i));
+
+        log_debug("Writing to \"%s\".", path);
+
+        r = loop_write(fd, item_binary_argument(i), item_binary_argument_size(i), /* do_poll= */ false);
+        if (r < 0)
+                return log_error_errno(r, "Failed to write file \"%s\": %m", path);
+
+        return 0;
+}
+
 static int write_one_file(Item *i, const char *path) {
         _cleanup_close_ int fd = -1, dir_fd = -1;
         _cleanup_free_ char *bn = NULL;
@@ -1336,7 +1370,6 @@ static int write_one_file(Item *i, const char *path) {
 
         assert(i);
         assert(path);
-        assert(i->argument);
         assert(i->type == WRITE_FILE);
 
         r = path_extract_filename(path, &bn);
@@ -1368,11 +1401,10 @@ static int write_one_file(Item *i, const char *path) {
         }
 
         /* 'w' is allowed to write into any kind of files. */
-        log_debug("Writing to \"%s\".", path);
 
-        r = loop_write(fd, i->argument, strlen(i->argument), false);
+        r = write_argument_data(i, fd, path);
         if (r < 0)
-                return log_error_errno(r, "Failed to write file \"%s\": %m", path);
+                return r;
 
         return fd_set_perms(i, fd, path, NULL);
 }
@@ -1432,17 +1464,10 @@ static int create_file(Item *i, const char *path) {
                                                path);
 
                 st = &stbuf;
-        } else {
-
-                log_debug("\"%s\" has been created.", path);
-
-                if (i->argument) {
-                        log_debug("Writing to \"%s\".", path);
-
-                        r = loop_write(fd, i->argument, strlen(i->argument), false);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to write file \"%s\": %m", path);
-                }
+        } else if (item_binary_argument(i)) {
+                r = write_argument_data(i, fd, path);
+                if (r < 0)
+                        return r;
         }
 
         return fd_set_perms(i, fd, path, st);
@@ -1522,12 +1547,10 @@ static int truncate_file(Item *i, const char *path) {
 
         log_debug("\"%s\" has been created.", path);
 
-        if (i->argument) {
-                log_debug("Writing to \"%s\".", path);
-
-                r = loop_write(fd, i->argument, strlen(i->argument), false);
+        if (item_binary_argument(i)) {
+                r = write_argument_data(i, fd, path);
                 if (r < 0)
-                        return log_error_errno(erofs ? -EROFS : r, "Failed to write file %s: %m", path);
+                        return r;
         }
 
         return fd_set_perms(i, fd, path, st);
@@ -1629,15 +1652,12 @@ static int create_directory_or_subvolume(const char *path, mode_t mode, bool sub
                         r = btrfs_is_subvol(empty_to_root(arg_root)) > 0;
                 }
                 if (!r)
-                        /* Don't create a subvolume unless the root directory is
-                         * one, too. We do this under the assumption that if the
-                         * root directory is just a plain directory (i.e. very
-                         * light-weight), we shouldn't try to split it up into
-                         * subvolumes (i.e. more heavy-weight). Thus, chroot()
-                         * environments and suchlike will get a full brtfs
-                         * subvolume set up below their tree only if they
-                         * specifically set up a btrfs subvolume for the root
-                         * dir too. */
+                        /* Don't create a subvolume unless the root directory is one, too. We do this under
+                         * the assumption that if the root directory is just a plain directory (i.e. very
+                         * light-weight), we shouldn't try to split it up into subvolumes (i.e. more
+                         * heavy-weight). Thus, chroot() environments and suchlike will get a full brtfs
+                         * subvolume set up below their tree only if they specifically set up a btrfs
+                         * subvolume for the root dir too. */
 
                         subvol = false;
                 else {
@@ -1657,7 +1677,7 @@ static int create_directory_or_subvolume(const char *path, mode_t mode, bool sub
                 if (!IN_SET(r, -EEXIST, -EROFS))
                         return log_error_errno(r, "Failed to create directory or subvolume \"%s\": %m", path);
 
-                k = is_dir_fd(pfd);
+                k = is_dir_full(pfd, bn, /* follow= */ false);
                 if (k == -ENOENT && r == -EROFS)
                         return log_error_errno(r, "%s does not exist and cannot be created as the file system is read-only.", path);
                 if (k < 0)
@@ -2646,6 +2666,7 @@ static void item_free_contents(Item *i) {
         assert(i);
         free(i->path);
         free(i->argument);
+        free(i->binary_argument);
         strv_free(i->xattrs);
 
 #if HAVE_ACL
@@ -2687,7 +2708,8 @@ static bool item_compatible(const Item *a, const Item *b) {
 
         if (takes_ownership(a->type) && takes_ownership(b->type))
                 /* check if the items are the same */
-                return  streq_ptr(a->argument, b->argument) &&
+                return memcmp_nn(item_binary_argument(a), item_binary_argument_size(a),
+                                 item_binary_argument(b), item_binary_argument_size(b)) == 0 &&
 
                         a->uid_set == b->uid_set &&
                         a->uid == b->uid &&
@@ -2956,7 +2978,7 @@ static int parse_line(
         ItemArray *existing;
         OrderedHashmap *h;
         int r, pos;
-        bool append_or_force = false, boot = false, allow_failure = false, try_replace = false;
+        bool append_or_force = false, boot = false, allow_failure = false, try_replace = false, unbase64 = false, from_cred = false;
 
         assert(fname);
         assert(line >= 1);
@@ -3027,6 +3049,10 @@ static int parse_line(
                         allow_failure = true;
                 else if (action[pos] == '=' && !try_replace)
                         try_replace = true;
+                else if (action[pos] == '~' && !unbase64)
+                        unbase64 = true;
+                else if (action[pos] == '^' && !from_cred)
+                        from_cred = true;
                 else {
                         *invalid_config = true;
                         return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG), "Unknown modifiers in command '%s'", action);
@@ -3056,6 +3082,14 @@ static int parse_line(
         if (r < 0)
                 return r;
 
+        if (!path_is_absolute(i.path)) {
+                *invalid_config = true;
+                return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG),
+                                  "Path '%s' not absolute.", i.path);
+        }
+
+        path_simplify(i.path);
+
         switch (i.type) {
 
         case CREATE_DIRECTORY:
@@ -3073,7 +3107,13 @@ static int parse_line(
         case RELABEL_PATH:
         case RECURSIVE_RELABEL_PATH:
                 if (i.argument)
-                        log_syntax(NULL, LOG_WARNING, fname, line, 0, "%c lines don't take argument fields, ignoring.", i.type);
+                        log_syntax(NULL,
+                                   LOG_WARNING,
+                                   fname,
+                                   line,
+                                   0,
+                                   "%c lines don't take argument fields, ignoring.",
+                                   (char) i.type);
 
                 break;
 
@@ -3082,6 +3122,11 @@ static int parse_line(
                 break;
 
         case CREATE_SYMLINK:
+                if (unbase64) {
+                        *invalid_config = true;
+                        return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG), "base64 decoding not supported for symlink targets.");
+                }
+
                 if (!i.argument) {
                         i.argument = path_join("/usr/share/factory", i.path);
                         if (!i.argument)
@@ -3097,11 +3142,15 @@ static int parse_line(
                 break;
 
         case COPY_FILES:
+                if (unbase64) {
+                        *invalid_config = true;
+                        return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG), "base64 decoding not supported for copy sources.");
+                }
+
                 if (!i.argument) {
                         i.argument = path_join("/usr/share/factory", i.path);
                         if (!i.argument)
                                 return log_oom();
-
                 } else if (!path_is_absolute(i.argument)) {
                         *invalid_config = true;
                         return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG), "Source path '%s' is not absolute.", i.argument);
@@ -3118,10 +3167,22 @@ static int parse_line(
                 }
 
                 path_simplify(i.argument);
+
+                if (laccess(i.argument, F_OK) == -ENOENT) {
+                        /* Silently skip over lines where the source file is missing. */
+                        log_syntax(NULL, LOG_INFO, fname, line, 0, "Copy source path '%s' does not exist, skipping line.", i.argument);
+                        return 0;
+                }
+
                 break;
 
         case CREATE_CHAR_DEVICE:
         case CREATE_BLOCK_DEVICE:
+                if (unbase64) {
+                        *invalid_config = true;
+                        return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG), "base64 decoding not supported for device node creation.");
+                }
+
                 if (!i.argument) {
                         *invalid_config = true;
                         return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG), "Device file requires argument.");
@@ -3137,6 +3198,10 @@ static int parse_line(
 
         case SET_XATTR:
         case RECURSIVE_SET_XATTR:
+                if (unbase64) {
+                        *invalid_config = true;
+                        return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG), "base64 decoding not supported for extended attributes.");
+                }
                 if (!i.argument) {
                         *invalid_config = true;
                         return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG),
@@ -3149,6 +3214,10 @@ static int parse_line(
 
         case SET_ACL:
         case RECURSIVE_SET_ACL:
+                if (unbase64) {
+                        *invalid_config = true;
+                        return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG), "base64 decoding not supported for ACLs.");
+                }
                 if (!i.argument) {
                         *invalid_config = true;
                         return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG),
@@ -3161,6 +3230,10 @@ static int parse_line(
 
         case SET_ATTRIBUTE:
         case RECURSIVE_SET_ATTRIBUTE:
+                if (unbase64) {
+                        *invalid_config = true;
+                        return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG), "base64 decoding not supported for file attributes.");
+                }
                 if (!i.argument) {
                         *invalid_config = true;
                         return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG),
@@ -3179,24 +3252,48 @@ static int parse_line(
                                   "Unknown command type '%c'.", (char) i.type);
         }
 
-        if (!path_is_absolute(i.path)) {
-                *invalid_config = true;
-                return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG),
-                                  "Path '%s' not absolute.", i.path);
-        }
-
-        path_simplify(i.path);
-
         if (!should_include_path(i.path))
                 return 0;
 
-        r = specifier_expansion_from_arg(specifier_table, &i);
-        if (r == -ENXIO)
-                return log_unresolvable_specifier(fname, line);
-        if (r < 0) {
-                if (IN_SET(r, -EINVAL, -EBADSLT))
-                        *invalid_config = true;
-                return log_syntax(NULL, LOG_ERR, fname, line, r, "Failed to substitute specifiers in argument: %m");
+        if (!unbase64) {
+                /* Do specifier expansion except if base64 mode is enabled */
+                r = specifier_expansion_from_arg(specifier_table, &i);
+                if (r == -ENXIO)
+                        return log_unresolvable_specifier(fname, line);
+                if (r < 0) {
+                        if (IN_SET(r, -EINVAL, -EBADSLT))
+                                *invalid_config = true;
+                        return log_syntax(NULL, LOG_ERR, fname, line, r, "Failed to substitute specifiers in argument: %m");
+                }
+        }
+
+        if (from_cred) {
+                if (!i.argument)
+                        return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EINVAL), "Reading from credential requested, but no credential name specified.");
+                if (!credential_name_valid(i.argument))
+                        return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EINVAL), "Credential name not valid: %s", i.argument);
+
+                r = read_credential(i.argument, &i.binary_argument, &i.binary_argument_size);
+                if (IN_SET(r, -ENXIO, -ENOENT)) {
+                        /* Silently skip over lines that have no credentials passed */
+                        log_syntax(NULL, LOG_INFO, fname, line, 0, "Credential '%s' not specified, skipping line.", i.argument);
+                        return 0;
+                }
+                if (r < 0)
+                        return log_error_errno(r, "Failed to read credential '%s': %m", i.argument);
+        }
+
+        /* If base64 decoding is requested, do so now */
+        if (unbase64 && item_binary_argument(&i)) {
+                _cleanup_free_ void *data = NULL;
+                size_t data_size = 0;
+
+                r = unbase64mem(item_binary_argument(&i), item_binary_argument_size(&i), &data, &data_size);
+                if (r < 0)
+                        return log_syntax(NULL, LOG_ERR, fname, line, r, "Failed to base64 decode specified argument '%s': %m", i.argument);
+
+                free_and_replace(i.binary_argument, data);
+                i.binary_argument_size = data_size;
         }
 
         if (!empty_or_root(arg_root)) {
@@ -3537,7 +3634,12 @@ static int parse_argv(int argc, char *argv[]) {
         return 1;
 }
 
-static int read_config_file(char **config_dirs, const char *fn, bool ignore_enoent, bool *invalid_config) {
+static int read_config_file(
+                char **config_dirs,
+                const char *fn,
+                bool ignore_enoent,
+                bool *invalid_config) {
+
         _cleanup_(hashmap_freep) Hashmap *uid_cache = NULL, *gid_cache = NULL;
         _cleanup_fclose_ FILE *_f = NULL;
         _cleanup_free_ char *pp = NULL;
@@ -3676,6 +3778,25 @@ static int read_config_files(char **config_dirs, char **args, bool *invalid_conf
                          * read_config_file() has some debug output, so no need to print anything. */
                         (void) read_config_file(config_dirs, *f, true, invalid_config);
 
+        return 0;
+}
+
+static int read_credential_lines(bool *invalid_config) {
+        _cleanup_free_ char *j = NULL;
+        const char *d;
+        int r;
+
+        r = get_credentials_dir(&d);
+        if (r == -ENXIO)
+                return 0;
+        if (r < 0)
+                return log_error_errno(r, "Failed to get credentials directory: %m");
+
+        j = path_join(d, "tmpfiles.extra");
+        if (!j)
+                return log_oom();
+
+        (void) read_config_file(/* config_dirs= */ NULL, j, /* ignore_enoent= */ true, invalid_config);
         return 0;
 }
 
@@ -3832,6 +3953,10 @@ static int run(int argc, char *argv[]) {
                 r = read_config_files(config_dirs, argv + optind, &invalid_config);
         else
                 r = parse_arguments(config_dirs, argv + optind, &invalid_config);
+        if (r < 0)
+                return r;
+
+        r = read_credential_lines(&invalid_config);
         if (r < 0)
                 return r;
 

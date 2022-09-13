@@ -15,6 +15,7 @@
 #include "macro.h"
 #include "mkdir-label.h"
 #include "path-util.h"
+#include "process-util.h"
 #include "special.h"
 #include "specifier.h"
 #include "string-util.h"
@@ -28,11 +29,13 @@ int generator_open_unit_file(
                 const char *name,
                 FILE **file) {
 
-        const char *unit;
+        _cleanup_free_ char *unit = NULL;
         FILE *f;
         int r;
 
-        unit = prefix_roota(dest, name);
+        unit = path_join(dest, name);
+        if (!unit)
+                return log_oom();
 
         r = fopen_unlocked(unit, "wxe", &f);
         if (r < 0) {
@@ -351,8 +354,8 @@ int generator_hook_up_mkswap(
                 const char *what) {
 
         _cleanup_free_ char *node = NULL, *unit = NULL, *escaped = NULL, *where_unit = NULL;
+        _cleanup_free_ char *unit_file = NULL;
         _cleanup_fclose_ FILE *f = NULL;
-        const char *unit_file;
         int r;
 
         node = fstab_node_to_udev_node(what);
@@ -370,7 +373,10 @@ int generator_hook_up_mkswap(
                 return log_error_errno(r, "Failed to make unit instance name from path \"%s\": %m",
                                        node);
 
-        unit_file = prefix_roota(dir, unit);
+        unit_file = path_join(dir, unit);
+        if (!unit_file)
+                return log_oom();
+
         log_debug("Creating %s", unit_file);
 
         escaped = cescape(node);
@@ -420,9 +426,8 @@ int generator_hook_up_mkfs(
                 const char *where,
                 const char *type) {
 
-        _cleanup_free_ char *node = NULL, *unit = NULL, *escaped = NULL, *where_unit = NULL;
+        _cleanup_free_ char *node = NULL, *unit = NULL, *unit_file = NULL, *escaped = NULL, *where_unit = NULL;
         _cleanup_fclose_ FILE *f = NULL;
-        const char *unit_file;
         int r;
 
         node = fstab_node_to_udev_node(what);
@@ -445,7 +450,10 @@ int generator_hook_up_mkfs(
                 return log_error_errno(r, "Failed to make unit instance name from path \"%s\": %m",
                                        node);
 
-        unit_file = prefix_roota(dir, unit);
+        unit_file = path_join(dir, unit);
+        if (!unit_file)
+                return log_oom();
+
         log_debug("Creating %s", unit_file);
 
         escaped = cescape(node);
@@ -498,9 +506,8 @@ int generator_hook_up_growfs(
                 const char *where,
                 const char *target) {
 
-        _cleanup_free_ char *unit = NULL, *escaped = NULL, *where_unit = NULL;
+        _cleanup_free_ char *unit = NULL, *escaped = NULL, *where_unit = NULL, *unit_file = NULL;
         _cleanup_fclose_ FILE *f = NULL;
-        const char *unit_file;
         int r;
 
         assert(dir);
@@ -520,7 +527,10 @@ int generator_hook_up_growfs(
                 return log_error_errno(r, "Failed to make unit name from path \"%s\": %m",
                                        where);
 
-        unit_file = prefix_roota(dir, unit);
+        unit_file = path_join(dir, unit);
+        if (!unit_file)
+                return log_oom();
+
         log_debug("Creating %s", unit_file);
 
         f = fopen(unit_file, "wxe");
@@ -536,7 +546,7 @@ int generator_hook_up_growfs(
                 "DefaultDependencies=no\n"
                 "BindsTo=%%i.mount\n"
                 "Conflicts=shutdown.target\n"
-                "After=%%i.mount\n"
+                "After=systemd-repart.service %%i.mount\n"
                 "Before=shutdown.target%s%s\n",
                 program_invocation_short_name,
                 target ? " " : "",
@@ -737,11 +747,15 @@ int generator_write_veritysetup_service_section(
 }
 
 void log_setup_generator(void) {
-        /* Disable talking to syslog/journal (i.e. the two IPC-based loggers) if we run in system context. */
-        if (cg_pid_get_owner_uid(0, NULL) == -ENXIO /* not running in a per-user slice */)
-                log_set_prohibit_ipc(true);
+        if (invoked_by_systemd()) {
+                /* Disable talking to syslog/journal (i.e. the two IPC-based loggers) if we run in system context. */
+                if (cg_pid_get_owner_uid(0, NULL) == -ENXIO /* not running in a per-user slice */)
+                        log_set_prohibit_ipc(true);
 
-        log_set_target(LOG_TARGET_JOURNAL_OR_KMSG); /* This effectively means: journal for per-user generators, kmsg otherwise */
+                /* This effectively means: journal for per-user generators, kmsg otherwise */
+                log_set_target(LOG_TARGET_JOURNAL_OR_KMSG);
+        }
+
         log_parse_environment();
         (void) log_open();
 }

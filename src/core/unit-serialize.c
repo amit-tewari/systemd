@@ -592,6 +592,7 @@ static void print_unit_dependency_mask(FILE *f, const char *kind, UnitDependency
                 { UNIT_DEPENDENCY_PATH,               "path"               },
                 { UNIT_DEPENDENCY_MOUNTINFO_IMPLICIT, "mountinfo-implicit" },
                 { UNIT_DEPENDENCY_MOUNTINFO_DEFAULT,  "mountinfo-default"  },
+                { UNIT_DEPENDENCY_MOUNTINFO_OR_FILE,  "mountinfo-or-file"  },
                 { UNIT_DEPENDENCY_PROC_SWAP,          "proc-swap"          },
                 { UNIT_DEPENDENCY_SLICE_PROPERTY,     "slice-property"     },
         };
@@ -731,6 +732,9 @@ void unit_dump(Unit *u, FILE *f, const char *prefix) {
 
         STRV_FOREACH(j, u->documentation)
                 fprintf(f, "%s\tDocumentation: %s\n", prefix, *j);
+
+        if (u->access_selinux_context)
+                fprintf(f, "%s\tAccess SELinux Context: %s\n", prefix, u->access_selinux_context);
 
         following = unit_following(u);
         if (following)

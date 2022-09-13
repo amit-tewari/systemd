@@ -89,7 +89,7 @@ bool arg_ask_password = false;
 bool arg_runtime = false;
 UnitFilePresetMode arg_preset_mode = UNIT_FILE_PRESET_FULL;
 char **arg_wall = NULL;
-const char *arg_kill_who = NULL;
+const char *arg_kill_whom = NULL;
 int arg_signal = SIGTERM;
 char *arg_root = NULL;
 usec_t arg_when = 0;
@@ -117,7 +117,7 @@ STATIC_DESTRUCTOR_REGISTER(arg_states, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_properties, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(_arg_job_mode, unsetp);
 STATIC_DESTRUCTOR_REGISTER(arg_wall, strv_freep);
-STATIC_DESTRUCTOR_REGISTER(arg_kill_who, unsetp);
+STATIC_DESTRUCTOR_REGISTER(arg_kill_whom, unsetp);
 STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_reboot_argument, unsetp);
 STATIC_DESTRUCTOR_REGISTER(arg_host, unsetp);
@@ -138,6 +138,8 @@ static int systemctl_help(void) {
                "%5$sQuery or send control commands to the system manager.%6$s\n"
                "\n%3$sUnit Commands:%4$s\n"
                "  list-units [PATTERN...]             List units currently in memory\n"
+               "  list-automounts [PATTERN...]        List automount units currently in memory,\n"
+               "                                      ordered by path\n"
                "  list-sockets [PATTERN...]           List socket units currently in memory,\n"
                "                                      ordered by address\n"
                "  list-timers [PATTERN...]            List timer units currently in memory,\n"
@@ -260,7 +262,7 @@ static int systemctl_help(void) {
                "                         Whether to check inhibitors before shutting down,\n"
                "                         sleeping, or hibernating\n"
                "  -i                     Shortcut for --check-inhibitors=no\n"
-               "     --kill-who=WHO      Whom to send signal to\n"
+               "     --kill-whom=WHOM    Whom to send signal to\n"
                "  -s --signal=SIGNAL     Which signal to send\n"
                "     --what=RESOURCES    Which types of resources to remove\n"
                "     --now               Start or stop unit after enabling or disabling it\n"
@@ -401,7 +403,7 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                 ARG_NO_WALL,
                 ARG_ROOT,
                 ARG_NO_RELOAD,
-                ARG_KILL_WHO,
+                ARG_KILL_WHOM,
                 ARG_NO_ASK_PASSWORD,
                 ARG_FAILED,
                 ARG_RUNTIME,
@@ -457,7 +459,7 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                 { "root",                required_argument, NULL, ARG_ROOT                },
                 { "force",               no_argument,       NULL, 'f'                     },
                 { "no-reload",           no_argument,       NULL, ARG_NO_RELOAD           },
-                { "kill-who",            required_argument, NULL, ARG_KILL_WHO            },
+                { "kill-whom",           required_argument, NULL, ARG_KILL_WHOM           },
                 { "signal",              required_argument, NULL, 's'                     },
                 { "no-ask-password",     no_argument,       NULL, ARG_NO_ASK_PASSWORD     },
                 { "host",                required_argument, NULL, 'H'                     },
@@ -691,8 +693,8 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                         arg_no_reload = true;
                         break;
 
-                case ARG_KILL_WHO:
-                        arg_kill_who = optarg;
+                case ARG_KILL_WHOM:
+                        arg_kill_whom = optarg;
                         break;
 
                 case 's':
@@ -1022,6 +1024,7 @@ static int systemctl_main(int argc, char *argv[]) {
         static const Verb verbs[] = {
                 { "list-units",            VERB_ANY, VERB_ANY, VERB_DEFAULT|VERB_ONLINE_ONLY, verb_list_units },
                 { "list-unit-files",       VERB_ANY, VERB_ANY, 0,                verb_list_unit_files         },
+                { "list-automounts",       VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, verb_list_automounts         },
                 { "list-sockets",          VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, verb_list_sockets            },
                 { "list-timers",           VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, verb_list_timers             },
                 { "list-jobs",             VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, verb_list_jobs               },

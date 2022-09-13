@@ -60,7 +60,7 @@ efi_ld = get_option('efi-ld')
 if efi_ld == 'auto'
         efi_ld = cc.get_linker_id().split('.')[1]
         if efi_ld not in ['bfd', 'gold']
-                warning('Not using @0@ as efi-ld, falling back to bfd'.format(efi_ld))
+                message('Not using @0@ as efi-ld, falling back to bfd'.format(efi_ld))
                 efi_ld = 'bfd'
         endif
 endif
@@ -199,6 +199,12 @@ efi_cflags = [
         ]
 )
 
+# On some distros, sd-boot/-stub may trigger some bug somewhere that will cause
+# kernel execution to fail. The cause seems to be purely based on code size and
+# always compiling with at least -O1 will work around that.
+# https://github.com/systemd/systemd/issues/24202
+efi_cflags += '-O1'
+
 efi_cflags += cc.get_supported_arguments({
         'ia32':   ['-mno-sse', '-mno-mmx'],
         'x86_64': ['-mno-red-zone', '-mno-sse', '-mno-mmx'],
@@ -259,6 +265,21 @@ efi_ldflags = [
         '-z', 'nocombreloc',
         efi_crt0,
 ]
+
+foreach arg : ['-Wl,--no-warn-execstack',
+               '-Wl,--no-warn-rwx-segments']
+        # We need to check the correct linker for supported args. This is what
+        # cc.has_multi_link_arguments() is for, but it helpfully overrides our
+        # choice of linker by putting its own -fuse-ld= arg after ours.
+        if run_command('bash', '-c',
+                       'exec "$@" -x c -o/dev/null <(echo "int main(void){return 0;}")' +
+                       ' -fuse-ld=' + efi_ld + ' -Wl,--fatal-warnings ' + arg,
+                       'bash', cc.cmd_array(),
+                       check : false).returncode() == 0
+                efi_ldflags += arg
+        endif
+endforeach
+
 if efi_arch[1] in ['aarch64', 'arm', 'riscv64']
         efi_ldflags += ['-shared']
         # Aarch64, ARM32 and 64bit RISC-V don't have an EFI capable objcopy.
@@ -348,6 +369,7 @@ efi_headers = files(
 
 common_sources = files(
         'assert.c',
+        'console.c',
         'devicetree.c',
         'disk.c',
         'efi-string.c',
@@ -362,7 +384,6 @@ common_sources = files(
 
 systemd_boot_sources = files(
         'boot.c',
-        'console.c',
         'drivers.c',
         'random-seed.c',
         'shim.c',

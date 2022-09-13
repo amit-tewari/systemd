@@ -22,6 +22,7 @@
 #include "bus-internal.h"
 #include "bus-locator.h"
 #include "cgroup-setup.h"
+#include "devnum-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -278,7 +279,7 @@ static int get_seat_from_display(const char *display, const char **seat, uint32_
         if (r < 0)
                 return r;
 
-        if (asprintf(&sys_path, "/sys/dev/char/%d:%d", major(display_ctty), minor(display_ctty)) < 0)
+        if (asprintf(&sys_path, "/sys/dev/char/" DEVNUM_FORMAT_STR, DEVNUM_FORMAT_VAL(display_ctty)) < 0)
                 return -ENOMEM;
         r = readlink_value(sys_path, &tty);
         if (r < 0)
@@ -411,16 +412,18 @@ static int append_session_tasks_max(pam_handle_t *handle, sd_bus_message *m, con
 static int append_session_cg_weight(pam_handle_t *handle, sd_bus_message *m, const char *limit, const char *field) {
         uint64_t val;
         int r;
+        bool is_cpu_weight;
 
+        is_cpu_weight = streq(field, "CPUWeight");
         if (isempty(limit))
                 return PAM_SUCCESS;
 
-        r = cg_weight_parse(limit, &val);
+        r = is_cpu_weight ? cg_cpu_weight_parse(limit, &val) : cg_weight_parse(limit, &val);
         if (r >= 0) {
                 r = sd_bus_message_append(m, "(sv)", field, "t", val);
                 if (r < 0)
                         return pam_bus_log_create_error(handle, r);
-        } else if (streq(field, "CPUWeight"))
+        } else if (is_cpu_weight)
                 pam_syslog(handle, LOG_WARNING, "Failed to parse systemd.cpu_weight, ignoring: %s", limit);
         else
                 pam_syslog(handle, LOG_WARNING, "Failed to parse systemd.io_weight, ignoring: %s", limit);
@@ -790,10 +793,7 @@ _public_ PAM_EXTERN int pam_sm_open_session(
                              * does the PAM session registration early for new connections, and registers a pty only
                              * much later (this is because it doesn't know yet if it needs one at all, as whether to
                              * register a pty or not is negotiated much later in the protocol). */
-        } else if (streq(tty, "systemd")) {
-                if (isempty(class))
-                        class = "user";
-                tty = NULL;
+
         } else
                 /* Chop off leading /dev prefix that some clients specify, but others do not. */
                 tty = skip_dev_prefix(tty);

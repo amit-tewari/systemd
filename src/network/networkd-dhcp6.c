@@ -224,6 +224,10 @@ static int dhcp6_request_address(
         if (verify_dhcp6_address(link, addr) < 0)
                 return 0;
 
+        r = free_and_strdup_warn(&addr->netlabel, link->network->dhcp6_netlabel);
+        if (r < 0)
+                return r;
+
         if (address_get(link, addr, &existing) < 0)
                 link->dhcp6_configured = false;
         else
@@ -266,8 +270,8 @@ static int dhcp6_address_acquired(Link *link) {
                         break;
 
                 r = dhcp6_request_address(link, &server_address, &ip6_addr,
-                                          usec_add(lifetime_preferred_sec * USEC_PER_SEC, timestamp_usec),
-                                          usec_add(lifetime_valid_sec * USEC_PER_SEC, timestamp_usec));
+                                          sec_to_usec(lifetime_preferred_sec, timestamp_usec),
+                                          sec_to_usec(lifetime_valid_sec, timestamp_usec));
                 if (r < 0)
                         return r;
         }
@@ -363,10 +367,9 @@ static int dhcp6_lease_lost(Link *link) {
 }
 
 static void dhcp6_handler(sd_dhcp6_client *client, int event, void *userdata) {
-        Link *link = userdata;
+        Link *link = ASSERT_PTR(userdata);
         int r;
 
-        assert(link);
         assert(link->network);
 
         if (IN_SET(link->state, LINK_STATE_FAILED, LINK_STATE_LINGER))
@@ -695,6 +698,12 @@ static int dhcp6_configure(Link *link) {
                         return log_link_debug_errno(link, r, "DHCPv6 CLIENT: Failed to set prefix delegation hint: %m");
         }
 
+        r = sd_dhcp6_client_set_rapid_commit(client, link->network->dhcp6_use_rapid_commit);
+        if (r < 0)
+                return log_link_debug_errno(link, r,
+                                            "DHCPv6 CLIENT: Failed to %s rapid commit: %m",
+                                            enable_disable(link->network->dhcp6_use_rapid_commit));
+
         link->dhcp6_client = TAKE_PTR(client);
 
         return 0;
@@ -735,12 +744,7 @@ static int dhcp6_process_request(Request *req, Link *link, void *userdata) {
 
         assert(link);
 
-        if (!IN_SET(link->state, LINK_STATE_CONFIGURING, LINK_STATE_CONFIGURED))
-                return 0;
-
-        if (!IN_SET(link->hw_addr.length, ETH_ALEN, INFINIBAND_ALEN) ||
-            hw_addr_is_null(&link->hw_addr))
-                /* No MAC address is assigned to the hardware, or non-supported MAC address length. */
+        if (!link_is_ready_to_configure(link, /* allow_unmanaged = */ false))
                 return 0;
 
         r = dhcp_configure_duid(link, link_get_dhcp6_duid(link));
@@ -816,7 +820,7 @@ int config_parse_dhcp6_pd_prefix_hint(
                 void *data,
                 void *userdata) {
 
-        Network *network = userdata;
+        Network *network = ASSERT_PTR(userdata);
         union in_addr_union u;
         unsigned char prefixlen;
         int r;
@@ -824,7 +828,6 @@ int config_parse_dhcp6_pd_prefix_hint(
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(userdata);
 
         r = in_addr_prefix_from_string(rvalue, AF_INET6, &u, &prefixlen);
         if (r < 0) {

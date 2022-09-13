@@ -13,6 +13,7 @@
 #include "bpf-socket-bind.h"
 #include "btrfs-util.h"
 #include "bus-error.h"
+#include "bus-locator.h"
 #include "cgroup-setup.h"
 #include "cgroup-util.h"
 #include "cgroup.h"
@@ -782,6 +783,9 @@ static void cgroup_xattr_apply(Unit *u) {
 
         assert(u);
 
+        /* The 'user.*' xattrs can be set from a user manager. */
+        cgroup_oomd_xattr_apply(u, u->cgroup_path);
+
         if (!MANAGER_IS_SYSTEM(u->manager))
                 return;
 
@@ -808,8 +812,6 @@ static void cgroup_xattr_apply(Unit *u) {
                 else
                         unit_remove_xattr_graceful(u, NULL, xn);
         }
-
-        cgroup_oomd_xattr_apply(u, u->cgroup_path);
 }
 
 static int lookup_block_device(const char *p, dev_t *ret) {
@@ -948,8 +950,23 @@ static usec_t cgroup_cpu_adjust_period_and_log(Unit *u, usec_t period, usec_t qu
 static void cgroup_apply_unified_cpu_weight(Unit *u, uint64_t weight) {
         char buf[DECIMAL_STR_MAX(uint64_t) + 2];
 
+        if (weight == CGROUP_WEIGHT_IDLE)
+                return;
         xsprintf(buf, "%" PRIu64 "\n", weight);
         (void) set_attribute_and_warn(u, "cpu", "cpu.weight", buf);
+}
+
+static void cgroup_apply_unified_cpu_idle(Unit *u, uint64_t weight) {
+        int r;
+        bool is_idle;
+        const char *idle_val;
+
+        is_idle = weight == CGROUP_WEIGHT_IDLE;
+        idle_val = one_zero(is_idle);
+        r = cg_set_attribute("cpu", u->cgroup_path, "cpu.idle", idle_val);
+        if (r < 0 && (r != -ENOENT || is_idle))
+                log_unit_full_errno(u, LOG_LEVEL_CGROUP_WRITE(r), r, "Failed to set '%s' attribute on '%s' to '%s': %m",
+                                    "cpu.idle", empty_to_root(u->cgroup_path), idle_val);
 }
 
 static void cgroup_apply_unified_cpu_quota(Unit *u, usec_t quota, usec_t period) {
@@ -992,6 +1009,10 @@ static uint64_t cgroup_cpu_shares_to_weight(uint64_t shares) {
 }
 
 static uint64_t cgroup_cpu_weight_to_shares(uint64_t weight) {
+        /* we don't support idle in cgroupv1 */
+        if (weight == CGROUP_WEIGHT_IDLE)
+                return CGROUP_CPU_SHARES_MIN;
+
         return CLAMP(weight * CGROUP_CPU_SHARES_DEFAULT / CGROUP_WEIGHT_DEFAULT,
                      CGROUP_CPU_SHARES_MIN, CGROUP_CPU_SHARES_MAX);
 }
@@ -1397,6 +1418,7 @@ static void cgroup_context_apply(
                         } else
                                 weight = CGROUP_WEIGHT_DEFAULT;
 
+                        cgroup_apply_unified_cpu_idle(u, weight);
                         cgroup_apply_unified_cpu_weight(u, weight);
                         cgroup_apply_unified_cpu_quota(u, c->cpu_quota_per_sec_usec, c->cpu_quota_period_usec);
 
@@ -1577,7 +1599,7 @@ static void cgroup_context_apply(
 
                         if (unit_has_unified_memory_config(u)) {
                                 val = c->memory_max;
-                                log_cgroup_compat(u, "Applying MemoryMax=%" PRIi64 " as MemoryLimit=", val);
+                                log_cgroup_compat(u, "Applying MemoryMax=%" PRIu64 " as MemoryLimit=", val);
                         } else
                                 val = c->memory_limit;
 
@@ -2261,14 +2283,12 @@ static int unit_attach_pid_to_cgroup_via_bus(Unit *u, pid_t pid, const char *suf
         pp = strjoina("/", pp, suffix_path);
         path_simplify(pp);
 
-        r = sd_bus_call_method(u->manager->system_bus,
-                               "org.freedesktop.systemd1",
-                               "/org/freedesktop/systemd1",
-                               "org.freedesktop.systemd1.Manager",
-                               "AttachProcessesToUnit",
-                               &error, NULL,
-                               "ssau",
-                               NULL /* empty unit name means client's unit, i.e. us */, pp, 1, (uint32_t) pid);
+        r = bus_call_method(u->manager->system_bus,
+                            bus_systemd_mgr,
+                            "AttachProcessesToUnit",
+                            &error, NULL,
+                            "ssau",
+                            NULL /* empty unit name means client's unit, i.e. us */, pp, 1, (uint32_t) pid);
         if (r < 0)
                 return log_unit_debug_errno(u, r, "Failed to attach unit process " PID_FMT " via the bus: %s", pid, bus_error_message(&error, r));
 
@@ -2276,6 +2296,7 @@ static int unit_attach_pid_to_cgroup_via_bus(Unit *u, pid_t pid, const char *suf
 }
 
 int unit_attach_pids_to_cgroup(Unit *u, Set *pids, const char *suffix_path) {
+        _cleanup_free_ char *joined = NULL;
         CGroupMask delegated_mask;
         const char *p;
         void *pidp;
@@ -2301,8 +2322,13 @@ int unit_attach_pids_to_cgroup(Unit *u, Set *pids, const char *suffix_path) {
 
         if (isempty(suffix_path))
                 p = u->cgroup_path;
-        else
-                p = prefix_roota(u->cgroup_path, suffix_path);
+        else {
+                joined = path_join(u->cgroup_path, suffix_path);
+                if (!joined)
+                        return -ENOMEM;
+
+                p = joined;
+        }
 
         delegated_mask = unit_get_delegate_mask(u);
 
@@ -2958,12 +2984,11 @@ int unit_watch_all_pids(Unit *u) {
 }
 
 static int on_cgroup_empty_event(sd_event_source *s, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         Unit *u;
         int r;
 
         assert(s);
-        assert(m);
 
         u = m->cgroup_empty_queue;
         if (!u)
@@ -3139,12 +3164,11 @@ int unit_check_oom(Unit *u) {
 }
 
 static int on_cgroup_oom_event(sd_event_source *s, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         Unit *u;
         int r;
 
         assert(s);
-        assert(m);
 
         u = m->cgroup_oom_queue;
         if (!u)
@@ -3242,11 +3266,10 @@ static int unit_check_cgroup_events(Unit *u) {
 }
 
 static int on_cgroup_inotify_event(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
 
         assert(s);
         assert(fd >= 0);
-        assert(m);
 
         for (;;) {
                 union inotify_event_buffer buffer;

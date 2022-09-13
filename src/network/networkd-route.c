@@ -107,6 +107,8 @@ Route *route_free(Route *route) {
 
         sd_event_source_disable_unref(route->expire);
 
+        free(route->tcp_congestion_control_algo);
+
         return mfree(route);
 }
 
@@ -319,6 +321,7 @@ int route_get(Manager *manager, Link *link, const Route *in, Route **ret) {
 
 int route_dup(const Route *src, Route **ret) {
         _cleanup_(route_freep) Route *dest = NULL;
+        int r;
 
         /* This does not copy mulipath routes. */
 
@@ -336,6 +339,11 @@ int route_dup(const Route *src, Route **ret) {
         dest->manager = NULL;
         dest->multipath_routes = NULL;
         dest->expire = NULL;
+        dest->tcp_congestion_control_algo = NULL;
+
+        r = free_and_strdup(&dest->tcp_congestion_control_algo, src->tcp_congestion_control_algo);
+        if (r < 0)
+                return r;
 
         *ret = TAKE_PTR(dest);
         return 0;
@@ -584,7 +592,7 @@ static void log_route_debug(const Route *route, const char *str, const Link *lin
                         if (m->ifname)
                                 (void) strextend(&gw_alloc, "@", m->ifname);
                         else if (m->ifindex > 0)
-                                (void) strextendf(&gw_alloc, "@%"PRIu32, m->ifindex);
+                                (void) strextendf(&gw_alloc, "@%i", m->ifindex);
                         /* See comments in config_parse_multipath_route(). */
                         (void) strextendf(&gw_alloc, ":%"PRIu32, m->weight + 1);
                 }
@@ -1008,11 +1016,10 @@ void link_foreignize_routes(Link *link) {
 }
 
 static int route_expire_handler(sd_event_source *s, uint64_t usec, void *userdata) {
-        Route *route = userdata;
+        Route *route = ASSERT_PTR(userdata);
         Link *link;
         int r;
 
-        assert(route);
         assert(route->manager || (route->link && route->link->manager));
 
         link = route->link; /* This may be NULL. */
@@ -1153,7 +1160,7 @@ int route_configure_handler_internal(sd_netlink *rtnl, sd_netlink_message *m, Li
         return 1;
 }
 
-static int route_configure(const Route *route, Link *link, Request *req) {
+static int route_configure(const Route *route, uint32_t lifetime_sec, Link *link, Request *req) {
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
         int r;
 
@@ -1179,9 +1186,8 @@ static int route_configure(const Route *route, Link *link, Request *req) {
         if (r < 0)
                 return r;
 
-        if (route->lifetime_usec != USEC_INFINITY) {
-                r = sd_netlink_message_append_u32(m, RTA_EXPIRES,
-                        MIN(DIV_ROUND_UP(usec_sub_unsigned(route->lifetime_usec, now(CLOCK_BOOTTIME)), USEC_PER_SEC), UINT32_MAX));
+        if (lifetime_sec != UINT32_MAX) {
+                r = sd_netlink_message_append_u32(m, RTA_EXPIRES, lifetime_sec);
                 if (r < 0)
                         return r;
         }
@@ -1228,6 +1234,12 @@ static int route_configure(const Route *route, Link *link, Request *req) {
 
         if (route->advmss > 0) {
                 r = sd_netlink_message_append_u32(m, RTAX_ADVMSS, route->advmss);
+                if (r < 0)
+                        return r;
+        }
+
+        if (!isempty(route->tcp_congestion_control_algo)) {
+                r = sd_netlink_message_append_string(m, RTAX_CC_ALGO, route->tcp_congestion_control_algo);
                 if (r < 0)
                         return r;
         }
@@ -1299,7 +1311,8 @@ static int route_is_ready_to_configure(const Route *route, Link *link) {
                 if (r < 0)
                         return false;
                 if (r > 0) {
-                        if (!link_is_ready_to_configure(l, true))
+                        if (!link_is_ready_to_configure(l, /* allow_unmanaged = */ true) ||
+                            !link_has_carrier(l))
                                 return false;
 
                         m->ifindex = l->ifindex;
@@ -1318,6 +1331,7 @@ static int route_process_request(Request *req, Link *link, Route *route) {
 
         assert(req);
         assert(link);
+        assert(link->manager);
         assert(route);
 
         r = route_is_ready_to_configure(route, link);
@@ -1356,7 +1370,25 @@ static int route_process_request(Request *req, Link *link, Route *route) {
                 }
         }
 
-        r = route_configure(route, link, req);
+        usec_t now_usec;
+        assert_se(sd_event_now(link->manager->event, CLOCK_BOOTTIME, &now_usec) >= 0);
+        uint32_t sec = usec_to_sec(route->lifetime_usec, now_usec);
+        if (sec == 0) {
+                log_link_debug(link, "Refuse to configure %s route with zero lifetime.",
+                               network_config_source_to_string(route->source));
+
+                if (converted)
+                        for (size_t i = 0; i < converted->n; i++) {
+                                Route *existing;
+
+                                assert_se(route_get(link->manager, converted->links[i] ?: link, converted->routes[i], &existing) >= 0);
+                                route_cancel_requesting(existing);
+                        }
+                else
+                        route_cancel_requesting(route);
+        }
+
+        r = route_configure(route, sec, link, req);
         if (r < 0)
                 return log_link_warning_errno(link, r, "Failed to configure route: %m");
 
@@ -1673,7 +1705,7 @@ int manager_rtnl_process_route(sd_netlink *rtnl, sd_netlink_message *message, Ma
                 return 0;
         } else if (r >= 0) {
                 if (ifindex <= 0) {
-                        log_warning("rtnl: received route message with invalid ifindex %d, ignoring.", ifindex);
+                        log_warning("rtnl: received route message with invalid ifindex %u, ignoring.", ifindex);
                         return 0;
                 }
 
@@ -1682,7 +1714,7 @@ int manager_rtnl_process_route(sd_netlink *rtnl, sd_netlink_message *message, Ma
                         /* when enumerating we might be out of sync, but we will
                          * get the route again, so just ignore it */
                         if (!m->enumerating)
-                                log_warning("rtnl: received route message for link (%d) we do not know about, ignoring", ifindex);
+                                log_warning("rtnl: received route message for link (%u) we do not know about, ignoring", ifindex);
                         return 0;
                 }
         }
@@ -2474,6 +2506,46 @@ int config_parse_route_type(
         }
 
         n->type = (unsigned char) t;
+
+        TAKE_PTR(n);
+        return 0;
+}
+
+int config_parse_tcp_congestion(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        Network *network = userdata;
+        _cleanup_(route_free_or_set_invalidp) Route *n = NULL;
+        int r;
+
+        assert(filename);
+        assert(section);
+        assert(lvalue);
+        assert(rvalue);
+        assert(data);
+
+        r = route_new_static(network, filename, section_line, &n);
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to allocate route, ignoring assignment: %m");
+                return 0;
+        }
+
+        r = config_parse_string(unit, filename, line, section, section_line, lvalue, ltype,
+                                rvalue, &n->tcp_congestion_control_algo, userdata);
+        if (r < 0)
+                return r;
 
         TAKE_PTR(n);
         return 0;

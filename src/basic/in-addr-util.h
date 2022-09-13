@@ -44,6 +44,7 @@ static inline bool in_addr_data_is_set(const struct in_addr_data *a) {
 int in_addr_is_multicast(int family, const union in_addr_union *u);
 
 bool in4_addr_is_link_local(const struct in_addr *a);
+bool in4_addr_is_link_local_dynamic(const struct in_addr *a);
 bool in6_addr_is_link_local(const struct in6_addr *a);
 int in_addr_is_link_local(int family, const union in_addr_union *u);
 bool in6_addr_is_link_local_all_nodes(const struct in6_addr *a);
@@ -137,6 +138,8 @@ int in_addr_from_string_auto(const char *s, int *ret_family, union in_addr_union
 
 unsigned char in4_addr_netmask_to_prefixlen(const struct in_addr *addr);
 struct in_addr* in4_addr_prefixlen_to_netmask(struct in_addr *addr, unsigned char prefixlen);
+struct in6_addr* in6_addr_prefixlen_to_netmask(struct in6_addr *addr, unsigned char prefixlen);
+int in_addr_prefixlen_to_netmask(int family, union in_addr_union *addr, unsigned char prefixlen);
 int in4_addr_default_prefixlen(const struct in_addr *addr, unsigned char *prefixlen);
 int in4_addr_default_subnet_mask(const struct in_addr *addr, struct in_addr *mask);
 int in4_addr_mask(struct in_addr *addr, unsigned char prefixlen);

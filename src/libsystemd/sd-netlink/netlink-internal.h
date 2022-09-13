@@ -109,7 +109,7 @@ struct netlink_attribute {
 };
 
 struct netlink_container {
-        const struct NLTypeSystem *type_system; /* the type system of the container */
+        const struct NLAPolicySet *policy_set; /* the policy set of the container */
         size_t offset; /* offset from hdr to the start of the container */
         struct netlink_attribute *attributes;
         uint16_t max_attribute; /* the maximum attribute in container */
@@ -133,7 +133,7 @@ int message_new_empty(sd_netlink *nl, sd_netlink_message **ret);
 int message_new_full(
                 sd_netlink *nl,
                 uint16_t nlmsg_type,
-                const NLTypeSystem *type_system,
+                const NLAPolicySet *policy_set,
                 size_t header_size,
                 sd_netlink_message **ret);
 int message_new(sd_netlink *nl, sd_netlink_message **ret, uint16_t type);
@@ -176,26 +176,38 @@ int netlink_add_match_internal(
 /* nfnl */
 /* TODO: to be exported later */
 int sd_nfnl_socket_open(sd_netlink **ret);
-int sd_nfnl_message_batch_begin(sd_netlink *nfnl, sd_netlink_message **ret);
-int sd_nfnl_message_batch_end(sd_netlink *nfnl, sd_netlink_message **ret);
-int sd_nfnl_nft_message_del_table(sd_netlink *nfnl, sd_netlink_message **ret,
-                                  int family, const char *table);
+int sd_nfnl_send_batch(
+                sd_netlink *nfnl,
+                sd_netlink_message **messages,
+                size_t msgcount,
+                uint32_t **ret_serials);
+int sd_nfnl_call_batch(
+                sd_netlink *nfnl,
+                sd_netlink_message **messages,
+                size_t n_messages,
+                uint64_t usec,
+                sd_netlink_message ***ret_messages);
+int sd_nfnl_message_new(
+                sd_netlink *nfnl,
+                sd_netlink_message **ret,
+                int nfproto,
+                uint16_t subsys,
+                uint16_t msg_type,
+                uint16_t flags);
 int sd_nfnl_nft_message_new_table(sd_netlink *nfnl, sd_netlink_message **ret,
-                                  int family, const char *table);
+                                  int nfproto, const char *table);
 int sd_nfnl_nft_message_new_basechain(sd_netlink *nfnl, sd_netlink_message **ret,
-                                      int family, const char *table, const char *chain,
+                                      int nfproto, const char *table, const char *chain,
                                       const char *type, uint8_t hook, int prio);
 int sd_nfnl_nft_message_new_rule(sd_netlink *nfnl, sd_netlink_message **ret,
-                                 int family, const char *table, const char *chain);
+                                 int nfproto, const char *table, const char *chain);
 int sd_nfnl_nft_message_new_set(sd_netlink *nfnl, sd_netlink_message **ret,
-                                int family, const char *table, const char *set_name,
+                                int nfproto, const char *table, const char *set_name,
                                 uint32_t setid, uint32_t klen);
-int sd_nfnl_nft_message_new_setelems_begin(sd_netlink *nfnl, sd_netlink_message **ret,
-                                           int family, const char *table, const char *set_name);
-int sd_nfnl_nft_message_del_setelems_begin(sd_netlink *nfnl, sd_netlink_message **ret,
-                                           int family, const char *table, const char *set_name);
-int sd_nfnl_nft_message_add_setelem(sd_netlink_message *m,
-                                    uint32_t num,
-                                    const void *key, uint32_t klen,
-                                    const void *data, uint32_t dlen);
-int sd_nfnl_nft_message_add_setelem_end(sd_netlink_message *m);
+int sd_nfnl_nft_message_new_setelems(sd_netlink *nfnl, sd_netlink_message **ret,
+                                     int add, int nfproto, const char *table, const char *set_name);
+int sd_nfnl_nft_message_append_setelem(sd_netlink_message *m,
+                                       uint32_t index,
+                                       const void *key, size_t key_len,
+                                       const void *data, size_t data_len,
+                                       uint32_t flags);

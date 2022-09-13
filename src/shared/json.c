@@ -2,7 +2,6 @@
 
 #include <errno.h>
 #include <locale.h>
-#include <math.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -18,6 +17,7 @@
 #include "json-internal.h"
 #include "json.h"
 #include "macro.h"
+#include "math-util.h"
 #include "memory-util.h"
 #include "string-table.h"
 #include "string-util.h"
@@ -253,9 +253,7 @@ static JsonVariant *json_variant_formalize(JsonVariant *v) {
                 return json_variant_unsigned(v) == 0 ? JSON_VARIANT_MAGIC_ZERO_UNSIGNED : v;
 
         case JSON_VARIANT_REAL:
-                DISABLE_WARNING_FLOAT_EQUAL;
-                return json_variant_real(v) == 0.0 ? JSON_VARIANT_MAGIC_ZERO_REAL : v;
-                REENABLE_WARNING;
+                return iszero_safe(json_variant_real(v)) ? JSON_VARIANT_MAGIC_ZERO_REAL : v;
 
         case JSON_VARIANT_STRING:
                 return isempty(json_variant_string(v)) ? JSON_VARIANT_MAGIC_EMPTY_STRING : v;
@@ -352,16 +350,16 @@ int json_variant_new_real(JsonVariant **ret, double d) {
 
         assert_return(ret, -EINVAL);
 
-        DISABLE_WARNING_FLOAT_EQUAL;
-        if (d == 0.0) {
-                *ret = JSON_VARIANT_MAGIC_ZERO_REAL;
-                return 0;
-        }
-        REENABLE_WARNING;
-
-        /* JSON doesn't know NaN, +Infinity or -Infinity. Let's silently convert to 'null'. */
-        if (isnan(d) || isinf(d)) {
+        r = fpclassify(d);
+        switch (r) {
+        case FP_NAN:
+        case FP_INFINITE:
+                /* JSON doesn't know NaN, +Infinity or -Infinity. Let's silently convert to 'null'. */
                 *ret = JSON_VARIANT_MAGIC_NULL;
+                return 0;
+
+        case FP_ZERO:
+                *ret = JSON_VARIANT_MAGIC_ZERO_REAL;
                 return 0;
         }
 
@@ -906,7 +904,7 @@ int64_t json_variant_integer(JsonVariant *v) {
                 if (v->value.unsig <= INT64_MAX)
                         return (int64_t) v->value.unsig;
 
-                log_debug("Unsigned integer %ju requested as signed integer and out of range, returning 0.", v->value.unsig);
+                log_debug("Unsigned integer %" PRIu64 " requested as signed integer and out of range, returning 0.", v->value.unsig);
                 return 0;
 
         case JSON_VARIANT_REAL: {
@@ -914,10 +912,8 @@ int64_t json_variant_integer(JsonVariant *v) {
 
                 converted = (int64_t) v->value.real;
 
-                DISABLE_WARNING_FLOAT_EQUAL;
-                if ((double) converted == v->value.real)
+                if (fp_equal((double) converted, v->value.real))
                         return converted;
-                REENABLE_WARNING;
 
                 log_debug("Real %g requested as integer, and cannot be converted losslessly, returning 0.", v->value.real);
                 return 0;
@@ -950,7 +946,7 @@ uint64_t json_variant_unsigned(JsonVariant *v) {
                 if (v->value.integer >= 0)
                         return (uint64_t) v->value.integer;
 
-                log_debug("Signed integer %ju requested as unsigned integer and out of range, returning 0.", v->value.integer);
+                log_debug("Signed integer %" PRIi64 " requested as unsigned integer and out of range, returning 0.", v->value.integer);
                 return 0;
 
         case JSON_VARIANT_UNSIGNED:
@@ -961,10 +957,8 @@ uint64_t json_variant_unsigned(JsonVariant *v) {
 
                 converted = (uint64_t) v->value.real;
 
-                DISABLE_WARNING_FLOAT_EQUAL;
-                if ((double) converted == v->value.real)
+                if (fp_equal((double) converted, v->value.real))
                         return converted;
-                REENABLE_WARNING;
 
                 log_debug("Real %g requested as unsigned integer, and cannot be converted losslessly, returning 0.", v->value.real);
                 return 0;
@@ -1002,7 +996,7 @@ double json_variant_real(JsonVariant *v) {
                 if ((int64_t) converted == v->value.integer)
                         return converted;
 
-                log_debug("Signed integer %ji requested as real, and cannot be converted losslessly, returning 0.", v->value.integer);
+                log_debug("Signed integer %" PRIi64 " requested as real, and cannot be converted losslessly, returning 0.", v->value.integer);
                 return 0.0;
         }
 
@@ -1012,7 +1006,7 @@ double json_variant_real(JsonVariant *v) {
                 if ((uint64_t) converted == v->value.unsig)
                         return converted;
 
-                log_debug("Unsigned integer %ju requested as real, and cannot be converted losslessly, returning 0.", v->value.unsig);
+                log_debug("Unsigned integer %" PRIu64 " requested as real, and cannot be converted losslessly, returning 0.", v->value.unsig);
                 return 0.0;
         }
 
@@ -1153,15 +1147,11 @@ bool json_variant_has_type(JsonVariant *v, JsonVariantType type) {
         if (rt == JSON_VARIANT_UNSIGNED && type == JSON_VARIANT_REAL)
                 return (uint64_t) (double) v->value.unsig == v->value.unsig;
 
-        DISABLE_WARNING_FLOAT_EQUAL;
-
         /* Any real that can be converted losslessly to an integer and back may also be considered an integer */
         if (rt == JSON_VARIANT_REAL && type == JSON_VARIANT_INTEGER)
-                return (double) (int64_t) v->value.real == v->value.real;
+                return fp_equal((double) (int64_t) v->value.real, v->value.real);
         if (rt == JSON_VARIANT_REAL && type == JSON_VARIANT_UNSIGNED)
-                return (double) (uint64_t) v->value.real == v->value.real;
-
-        REENABLE_WARNING;
+                return fp_equal((double) (uint64_t) v->value.real, v->value.real);
 
         return false;
 }
@@ -1314,9 +1304,7 @@ bool json_variant_equal(JsonVariant *a, JsonVariant *b) {
                 return json_variant_unsigned(a) == json_variant_unsigned(b);
 
         case JSON_VARIANT_REAL:
-                DISABLE_WARNING_FLOAT_EQUAL;
-                return json_variant_real(a) == json_variant_real(b);
-                REENABLE_WARNING;
+                return fp_equal(json_variant_real(a), json_variant_real(b));
 
         case JSON_VARIANT_BOOLEAN:
                 return json_variant_boolean(a) == json_variant_boolean(b);
@@ -1524,7 +1512,7 @@ static void json_format_string(FILE *f, const char *q, JsonFormatFlags flags) {
 
                 default:
                         if ((signed char) *q >= 0 && *q < ' ')
-                                fprintf(f, "\\u%04x", *q);
+                                fprintf(f, "\\u%04x", (unsigned) *q);
                         else
                                 fputc(*q, f);
                         break;
@@ -4132,6 +4120,30 @@ int json_build(JsonVariant **ret, ...) {
         return r;
 }
 
+int json_appendv(JsonVariant **v, va_list ap) {
+        _cleanup_(json_variant_unrefp) JsonVariant *w = NULL;
+        int r;
+
+        assert(v);
+
+        r = json_buildv(&w, ap);
+        if (r < 0)
+                return r;
+
+        return json_variant_merge(v, w);
+}
+
+int json_append(JsonVariant **v, ...) {
+        va_list ap;
+        int r;
+
+        va_start(ap, v);
+        r = json_appendv(v, ap);
+        va_end(ap);
+
+        return r;
+}
+
 int json_log_internal(
                 JsonVariant *variant,
                 int level,
@@ -4310,10 +4322,9 @@ int json_dispatch(JsonVariant *v, const JsonDispatch table[], JsonDispatchCallba
 }
 
 int json_dispatch_boolean(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata) {
-        bool *b = userdata;
+        bool *b = ASSERT_PTR(userdata);
 
         assert(variant);
-        assert(b);
 
         if (!json_variant_is_boolean(variant))
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a boolean.", strna(name));
@@ -4323,10 +4334,9 @@ int json_dispatch_boolean(const char *name, JsonVariant *variant, JsonDispatchFl
 }
 
 int json_dispatch_tristate(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata) {
-        int *b = userdata;
+        int *b = ASSERT_PTR(userdata);
 
         assert(variant);
-        assert(b);
 
         if (json_variant_is_null(variant)) {
                 *b = -1;
@@ -4341,10 +4351,9 @@ int json_dispatch_tristate(const char *name, JsonVariant *variant, JsonDispatchF
 }
 
 int json_dispatch_int64(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata) {
-        int64_t *i = userdata;
+        int64_t *i = ASSERT_PTR(userdata);
 
         assert(variant);
-        assert(i);
 
         if (!json_variant_is_integer(variant))
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not an integer.", strna(name));
@@ -4354,10 +4363,9 @@ int json_dispatch_int64(const char *name, JsonVariant *variant, JsonDispatchFlag
 }
 
 int json_dispatch_uint64(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata) {
-        uint64_t *u = userdata;
+        uint64_t *u = ASSERT_PTR(userdata);
 
         assert(variant);
-        assert(u);
 
         if (!json_variant_is_unsigned(variant))
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not an unsigned integer.", strna(name));
@@ -4367,10 +4375,9 @@ int json_dispatch_uint64(const char *name, JsonVariant *variant, JsonDispatchFla
 }
 
 int json_dispatch_uint32(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata) {
-        uint32_t *u = userdata;
+        uint32_t *u = ASSERT_PTR(userdata);
 
         assert(variant);
-        assert(u);
 
         if (!json_variant_is_unsigned(variant))
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not an unsigned integer.", strna(name));
@@ -4383,10 +4390,9 @@ int json_dispatch_uint32(const char *name, JsonVariant *variant, JsonDispatchFla
 }
 
 int json_dispatch_int32(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata) {
-        int32_t *i = userdata;
+        int32_t *i = ASSERT_PTR(userdata);
 
         assert(variant);
-        assert(i);
 
         if (!json_variant_is_integer(variant))
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not an integer.", strna(name));
@@ -4399,11 +4405,10 @@ int json_dispatch_int32(const char *name, JsonVariant *variant, JsonDispatchFlag
 }
 
 int json_dispatch_string(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata) {
-        char **s = userdata;
+        char **s = ASSERT_PTR(userdata);
         int r;
 
         assert(variant);
-        assert(s);
 
         if (json_variant_is_null(variant)) {
                 *s = mfree(*s);
@@ -4424,10 +4429,9 @@ int json_dispatch_string(const char *name, JsonVariant *variant, JsonDispatchFla
 }
 
 int json_dispatch_const_string(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata) {
-        const char **s = userdata;
+        const char **s = ASSERT_PTR(userdata);
 
         assert(variant);
-        assert(s);
 
         if (json_variant_is_null(variant)) {
                 *s = NULL;
@@ -4446,12 +4450,11 @@ int json_dispatch_const_string(const char *name, JsonVariant *variant, JsonDispa
 
 int json_dispatch_strv(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata) {
         _cleanup_strv_free_ char **l = NULL;
-        char ***s = userdata;
+        char ***s = ASSERT_PTR(userdata);
         JsonVariant *e;
         int r;
 
         assert(variant);
-        assert(s);
 
         if (json_variant_is_null(variant)) {
                 *s = strv_free(*s);

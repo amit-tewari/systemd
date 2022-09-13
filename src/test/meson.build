@@ -209,6 +209,10 @@ tests += [
 
         [files('test-macro.c')],
 
+        [files('test-math-util.c'),
+         [],
+         [libm]],
+
         [files('test-mkdir.c')],
 
         [files('test-json.c'),
@@ -227,6 +231,8 @@ tests += [
         [files('test-mountpoint-util.c')],
 
         [files('test-exec-util.c')],
+
+        [files('test-execve.c')],
 
         [files('test-hexdecoct.c')],
 

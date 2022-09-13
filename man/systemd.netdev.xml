@@ -217,6 +217,7 @@
       <xi:include href="systemd.link.xml" xpointer="virtualization" />
       <xi:include href="systemd.link.xml" xpointer="kernel-command-line" />
       <xi:include href="systemd.link.xml" xpointer="kernel-version" />
+      <xi:include href="systemd.link.xml" xpointer="credential" />
       <xi:include href="systemd.link.xml" xpointer="architecture" />
       <xi:include href="systemd.link.xml" xpointer="firmware" />
     </variablelist>
@@ -1557,6 +1558,15 @@
         <filename>/dev/net/tun</filename> device.</para>
         </listitem>
       </varlistentry>
+      <varlistentry>
+        <term><varname>KeepCarrier=</varname></term>
+        <listitem>
+          <para>Takes a boolean. If enabled, to make the interface maintain its carrier status, the file
+          descriptor of the interface is kept open. This may be useful to keep the interface in running
+          state, for example while the backing process is temporarily shutdown. Defaults to
+          <literal>no</literal>.</para>
+        </listitem>
+      </varlistentry>
     </variablelist>
   </refsect1>
 
@@ -2221,7 +2231,7 @@
         <term><varname>PhysicalDevice=</varname></term>
         <listitem>
           <para>Specifies the name or index of the physical WLAN device (e.g. <literal>0</literal> or
-          <literal>phy0</literal>). The list of the physical WLAN devices that exist os the host can be
+          <literal>phy0</literal>). The list of the physical WLAN devices that exist on the host can be
           obtained by <command>iw phy</command> command. This option is mandatory.</para>
         </listitem>
       </varlistentry>

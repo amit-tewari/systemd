@@ -3,6 +3,8 @@
 
 #include <sys/types.h>
 
+#include "sd-device.h"
+
 #include "macro.h"
 #include "stdio-util.h"
 #include "string-util.h"
@@ -27,3 +29,14 @@ int blockdev_partscan_enabled(int fd);
 
 int fd_is_encrypted(int fd);
 int path_is_encrypted(const char *path);
+
+int fd_get_whole_disk(int fd, bool backing, dev_t *ret);
+int path_get_whole_disk(const char *path, bool backing, dev_t *ret);
+
+int block_device_add_partition(int fd, const char *name, int nr, uint64_t start, uint64_t size);
+int block_device_remove_partition(int fd, const char *name, int nr);
+int block_device_resize_partition(int fd, int nr, uint64_t start, uint64_t size);
+int partition_enumerator_new(sd_device *dev, sd_device_enumerator **ret);
+int block_device_remove_all_partitions(sd_device *dev, int fd);
+int block_device_has_partitions(sd_device *dev);
+int blockdev_reread_partition_table(sd_device *dev);

@@ -134,6 +134,7 @@ static usec_t arg_default_restart_usec;
 static usec_t arg_default_timeout_start_usec;
 static usec_t arg_default_timeout_stop_usec;
 static usec_t arg_default_timeout_abort_usec;
+static usec_t arg_default_device_timeout_usec;
 static bool arg_default_timeout_abort_set;
 static usec_t arg_default_start_limit_interval;
 static unsigned arg_default_start_limit_burst;
@@ -170,6 +171,7 @@ static void *arg_random_seed;
 static size_t arg_random_seed_size;
 static int arg_default_oom_score_adjust;
 static bool arg_default_oom_score_adjust_set;
+static char *arg_default_smack_process_label;
 
 /* A copy of the original environment block */
 static char **saved_env = NULL;
@@ -626,6 +628,7 @@ static int parse_config_file(void) {
                 { "Manager", "DefaultTimeoutStartSec",       config_parse_sec,                   0,                        &arg_default_timeout_start_usec   },
                 { "Manager", "DefaultTimeoutStopSec",        config_parse_sec,                   0,                        &arg_default_timeout_stop_usec    },
                 { "Manager", "DefaultTimeoutAbortSec",       config_parse_default_timeout_abort, 0,                        NULL                              },
+                { "Manager", "DefaultDeviceTimeoutSec",      config_parse_sec,                   0,                        &arg_default_device_timeout_usec  },
                 { "Manager", "DefaultRestartSec",            config_parse_sec,                   0,                        &arg_default_restart_usec         },
                 { "Manager", "DefaultStartLimitInterval",    config_parse_sec,                   0,                        &arg_default_start_limit_interval }, /* obsolete alias */
                 { "Manager", "DefaultStartLimitIntervalSec", config_parse_sec,                   0,                        &arg_default_start_limit_interval },
@@ -658,6 +661,11 @@ static int parse_config_file(void) {
                 { "Manager", "CtrlAltDelBurstAction",        config_parse_emergency_action,      0,                        &arg_cad_burst_action             },
                 { "Manager", "DefaultOOMPolicy",             config_parse_oom_policy,            0,                        &arg_default_oom_policy           },
                 { "Manager", "DefaultOOMScoreAdjust",        config_parse_oom_score_adjust,      0,                        NULL                              },
+#if ENABLE_SMACK
+                { "Manager", "DefaultSmackProcessLabel",     config_parse_string,                0,                        &arg_default_smack_process_label  },
+#else
+                { "Manager", "DefaultSmackProcessLabel",     config_parse_warn_compat,           DISABLED_CONFIGURATION,   NULL                              },
+#endif
                 {}
         };
 
@@ -682,6 +690,7 @@ static int parse_config_file(void) {
                         "Manager\0",
                         config_item_table_lookup, items,
                         CONFIG_PARSE_WARN,
+                        NULL,
                         NULL,
                         NULL);
 
@@ -710,6 +719,7 @@ static void set_manager_defaults(Manager *m) {
         m->default_timeout_stop_usec = arg_default_timeout_stop_usec;
         m->default_timeout_abort_usec = arg_default_timeout_abort_usec;
         m->default_timeout_abort_set = arg_default_timeout_abort_set;
+        m->default_device_timeout_usec = arg_default_device_timeout_usec;
         m->default_restart_usec = arg_default_restart_usec;
         m->default_start_limit_interval = arg_default_start_limit_interval;
         m->default_start_limit_burst = arg_default_start_limit_burst;
@@ -730,6 +740,8 @@ static void set_manager_defaults(Manager *m) {
         m->default_oom_policy = arg_default_oom_policy;
         m->default_oom_score_adjust_set = arg_default_oom_score_adjust_set;
         m->default_oom_score_adjust = arg_default_oom_score_adjust;
+
+        (void) manager_set_default_smack_process_label(m, arg_default_smack_process_label);
 
         (void) manager_set_default_rlimits(m, arg_default_rlimit);
 
@@ -1958,6 +1970,8 @@ static int invoke_main_loop(
                         return objective;
 
                 case MANAGER_SWITCH_ROOT:
+                        manager_set_switching_root(m, true);
+
                         if (!m->switch_root_init) {
                                 r = prepare_reexecute(m, &arg_serialization, ret_fds, true);
                                 if (r < 0) {
@@ -2379,6 +2393,7 @@ static void reset_arguments(void) {
         arg_default_timeout_stop_usec = DEFAULT_TIMEOUT_USEC;
         arg_default_timeout_abort_usec = DEFAULT_TIMEOUT_USEC;
         arg_default_timeout_abort_set = false;
+        arg_default_device_timeout_usec = DEFAULT_TIMEOUT_USEC;
         arg_default_start_limit_interval = DEFAULT_START_LIMIT_INTERVAL;
         arg_default_start_limit_burst = DEFAULT_START_LIMIT_BURST;
         arg_runtime_watchdog = 0;
@@ -2421,6 +2436,7 @@ static void reset_arguments(void) {
         arg_clock_usec = 0;
 
         arg_default_oom_score_adjust_set = false;
+        arg_default_smack_process_label = mfree(arg_default_smack_process_label);
 }
 
 static void determine_default_oom_score_adjust(void) {
@@ -2810,11 +2826,17 @@ int main(int argc, char *argv[]) {
         } else {
                 /* Running as user instance */
                 arg_system = false;
+                log_set_always_reopen_console(true);
                 log_set_target(LOG_TARGET_AUTO);
                 log_open();
 
                 /* clear the kernel timestamp, because we are not PID 1 */
                 kernel_timestamp = DUAL_TIMESTAMP_NULL;
+
+                /* Clear ambient capabilities, so services do not inherit them implicitly. Dropping them does
+                 * not affect the permitted and effective sets which are important for the manager itself to
+                 * operate. */
+                capability_ambient_set_apply(0, /* also_inherit= */ false);
 
                 if (mac_selinux_init() < 0) {
                         error_message = "Failed to initialize SELinux support";
@@ -2928,6 +2950,7 @@ int main(int argc, char *argv[]) {
         set_manager_defaults(m);
         set_manager_settings(m);
         manager_set_first_boot(m, first_boot);
+        manager_set_switching_root(m, arg_switched_root);
 
         /* Remember whether we should queue the default job */
         queue_default_job = !arg_serialization || arg_switched_root;

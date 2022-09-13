@@ -38,16 +38,10 @@ bool link_ipv6_accept_ra_enabled(Link *link) {
         if (link->iftype == ARPHRD_CAN)
                 return false;
 
-        if (link->hw_addr.length != ETH_ALEN && !streq_ptr(link->kind, "wwan"))
-                /* Currently, only interfaces whose MAC address length is ETH_ALEN are supported.
-                 * Note, wwan interfaces may be assigned MAC address slightly later.
-                 * Hence, let's wait for a while.*/
-                return false;
-
         if (!link->network)
                 return false;
 
-        if (!link_may_have_ipv6ll(link))
+        if (!link_may_have_ipv6ll(link, /* check_multicast = */ true))
                 return false;
 
         assert(link->network->ipv6_accept_ra >= 0);
@@ -284,6 +278,10 @@ static int ndisc_request_address(Address *in, Link *link, sd_ndisc_router *rt) {
         address->source = NETWORK_CONFIG_SOURCE_NDISC;
         address->provider.in6 = router;
 
+        r = free_and_strdup_warn(&address->netlabel, link->network->ndisc_netlabel);
+        if (r < 0)
+                return r;
+
         if (address_get(link, address, &existing) < 0)
                 link->ndisc_configured = false;
         else
@@ -320,7 +318,7 @@ static int ndisc_router_process_default(Link *link, sd_ndisc_router *rt) {
         if (r < 0)
                 return log_link_error_errno(link, r, "Failed to get RA timestamp: %m");
 
-        lifetime_usec = usec_add(timestamp_usec, lifetime_sec * USEC_PER_SEC);
+        lifetime_usec = sec16_to_usec(lifetime_sec, timestamp_usec);
 
         r = sd_ndisc_router_get_address(rt, &gateway);
         if (r < 0)
@@ -442,8 +440,8 @@ static int ndisc_router_process_autonomous_prefix(Link *link, sd_ndisc_router *r
         if (lifetime_preferred_sec > lifetime_valid_sec)
                 return 0;
 
-        lifetime_valid_usec = usec_add(lifetime_valid_sec * USEC_PER_SEC, timestamp_usec);
-        lifetime_preferred_usec = usec_add(lifetime_preferred_sec * USEC_PER_SEC, timestamp_usec);
+        lifetime_valid_usec = sec_to_usec(lifetime_valid_sec, timestamp_usec);
+        lifetime_preferred_usec = sec_to_usec(lifetime_preferred_sec, timestamp_usec);
 
         r = ndisc_generate_addresses(link, &prefix, prefixlen, &addresses);
         if (r < 0)
@@ -519,7 +517,7 @@ static int ndisc_router_process_onlink_prefix(Link *link, sd_ndisc_router *rt) {
         route->family = AF_INET6;
         route->flags = RTM_F_PREFIX;
         route->dst_prefixlen = prefixlen;
-        route->lifetime_usec = usec_add(timestamp_usec, lifetime_sec * USEC_PER_SEC);
+        route->lifetime_usec = sec_to_usec(lifetime_sec, timestamp_usec);
 
         r = sd_ndisc_router_prefix_get_address(rt, &route->dst.in6);
         if (r < 0)
@@ -652,7 +650,7 @@ static int ndisc_router_process_route(Link *link, sd_ndisc_router *rt) {
         route->gw_family = AF_INET6;
         route->dst.in6 = dst;
         route->dst_prefixlen = prefixlen;
-        route->lifetime_usec = usec_add(timestamp_usec, lifetime_sec * USEC_PER_SEC);
+        route->lifetime_usec = sec_to_usec(lifetime_sec, timestamp_usec);
 
         r = ndisc_request_route(TAKE_PTR(route), link, rt);
         if (r < 0)
@@ -706,14 +704,14 @@ static int ndisc_router_process_rdnss(Link *link, sd_ndisc_router *rt) {
         if (lifetime_sec == 0)
                 return 0;
 
-        lifetime_usec = usec_add(timestamp_usec, lifetime_sec * USEC_PER_SEC);
+        lifetime_usec = sec_to_usec(lifetime_sec, timestamp_usec);
 
         n = sd_ndisc_router_rdnss_get_addresses(rt, &a);
         if (n < 0)
                 return log_link_error_errno(link, n, "Failed to get RDNSS addresses: %m");
 
         if (n >= (int) NDISC_RDNSS_MAX) {
-                log_link_warning(link, "Too many RDNSS records per link. Only first %i records will be used.", NDISC_RDNSS_MAX);
+                log_link_warning(link, "Too many RDNSS records per link. Only first %u records will be used.", NDISC_RDNSS_MAX);
                 n = NDISC_RDNSS_MAX;
         }
 
@@ -800,14 +798,14 @@ static int ndisc_router_process_dnssl(Link *link, sd_ndisc_router *rt) {
         if (lifetime_sec == 0)
                 return 0;
 
-        lifetime_usec = usec_add(timestamp_usec, lifetime_sec * USEC_PER_SEC);
+        lifetime_usec = sec_to_usec(lifetime_sec, timestamp_usec);
 
         r = sd_ndisc_router_dnssl_get_domains(rt, &l);
         if (r < 0)
                 return log_link_error_errno(link, r, "Failed to get DNSSL addresses: %m");
 
         if (strv_length(l) >= NDISC_DNSSL_MAX) {
-                log_link_warning(link, "Too many DNSSL records per link. Only first %i records will be used.", NDISC_DNSSL_MAX);
+                log_link_warning(link, "Too many DNSSL records per link. Only first %u records will be used.", NDISC_DNSSL_MAX);
                 STRV_FOREACH(j, l + NDISC_DNSSL_MAX)
                         *j = mfree(*j);
         }
@@ -1011,10 +1009,8 @@ static int ndisc_router_handler(Link *link, sd_ndisc_router *rt) {
 }
 
 static void ndisc_handler(sd_ndisc *nd, sd_ndisc_event_t event, sd_ndisc_router *rt, void *userdata) {
-        Link *link = userdata;
+        Link *link = ASSERT_PTR(userdata);
         int r;
-
-        assert(link);
 
         if (IN_SET(link->state, LINK_STATE_FAILED, LINK_STATE_LINGER))
                 return;
@@ -1060,9 +1056,11 @@ static int ndisc_configure(Link *link) {
         if (r < 0)
                 return r;
 
-        r = sd_ndisc_set_mac(link->ndisc, &link->hw_addr.ether);
-        if (r < 0)
-                return r;
+        if (link->hw_addr.length == ETH_ALEN) {
+                r = sd_ndisc_set_mac(link->ndisc, &link->hw_addr.ether);
+                if (r < 0)
+                        return r;
+        }
 
         r = sd_ndisc_set_ifindex(link->ndisc, link->ifindex);
         if (r < 0)
@@ -1103,11 +1101,7 @@ static int ndisc_process_request(Request *req, Link *link, void *userdata) {
 
         assert(link);
 
-        if (!IN_SET(link->state, LINK_STATE_CONFIGURING, LINK_STATE_CONFIGURED))
-                return 0;
-
-        if (link->hw_addr.length != ETH_ALEN || hw_addr_is_null(&link->hw_addr))
-                /* No MAC address is assigned to the hardware, or non-supported MAC address length. */
+        if (!link_is_ready_to_configure(link, /* allow_unmanaged = */ false))
                 return 0;
 
         r = ndisc_configure(link);
@@ -1145,20 +1139,21 @@ int link_request_ndisc(Link *link) {
 void ndisc_vacuum(Link *link) {
         NDiscRDNSS *r;
         NDiscDNSSL *d;
-        usec_t time_now;
+        usec_t now_usec;
 
         assert(link);
+        assert(link->manager);
 
         /* Removes all RDNSS and DNSSL entries whose validity time has passed */
 
-        time_now = now(CLOCK_BOOTTIME);
+        assert_se(sd_event_now(link->manager->event, CLOCK_BOOTTIME, &now_usec) >= 0);
 
         SET_FOREACH(r, link->ndisc_rdnss)
-                if (r->lifetime_usec < time_now)
+                if (r->lifetime_usec < now_usec)
                         free(set_remove(link->ndisc_rdnss, r));
 
         SET_FOREACH(d, link->ndisc_dnssl)
-                if (d->lifetime_usec < time_now)
+                if (d->lifetime_usec < now_usec)
                         free(set_remove(link->ndisc_dnssl, d));
 }
 

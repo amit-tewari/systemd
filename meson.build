@@ -310,6 +310,8 @@ conf.set_quoted('STATUS_UNIT_FORMAT_DEFAULT_STR',             status_unit_format
 
 conf.set10('FIRST_BOOT_FULL_PRESET',                          get_option('first-boot-full-preset'))
 
+conf.set10('EFI_TPM_PCR_COMPAT',                              get_option('efi-tpm-pcr-compat'))
+
 #####################################################################
 
 cc = meson.get_compiler('c')
@@ -345,7 +347,6 @@ endif
 # Those generate many false positives, and we do not want to change the code to
 # avoid them.
 basic_disabled_warnings = [
-        '-Wno-format-signedness',
         '-Wno-missing-field-initializers',
         '-Wno-unused-parameter',
 ]
@@ -354,6 +355,7 @@ possible_common_cc_flags = [
         '-Wdate-time',
         '-Wendif-labels',
         '-Werror=format=2',
+        '-Werror=format-signedness',
         '-Werror=implicit-function-declaration',
         '-Werror=incompatible-pointer-types',
         '-Werror=int-conversion',
@@ -389,6 +391,11 @@ possible_common_cc_flags = [
 ]
 
 c_args = get_option('c_args')
+
+# Our json library does not support -ffinite-math-only, which is enabled by -Ofast or -ffast-math.
+if (('-Ofast' in c_args or '-ffast-math' in c_args or '-ffinite-math-only' in c_args) and '-fno-finite-math-only' not in c_args)
+        error('-Ofast, -ffast-math, or -ffinite-math-only is specified in c_args.')
+endif
 
 # Disable -Wmaybe-uninitialized when compiling with -Os/-O1/-O3/etc. There are
 # too many false positives with gcc >= 8. Effectively, we only test with -O0
@@ -506,7 +513,6 @@ decl_headers = '''
 #include <uchar.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
-#include <linux/fs.h>
 '''
 
 foreach decl : ['char16_t',
@@ -517,6 +523,17 @@ foreach decl : ['char16_t',
 
         # We get -1 if the size cannot be determined
         have = cc.sizeof(decl, prefix : decl_headers, args : '-D_GNU_SOURCE') > 0
+
+        if decl == 'struct mount_attr'
+                if have
+                        want_linux_fs_h = false
+                else
+                        have = cc.sizeof(decl,
+                                         prefix : decl_headers + '#include <linux/fs.h>',
+                                         args : '-D_GNU_SOURCE') > 0
+                        want_linux_fs_h = have
+                endif
+        endif
 
         if decl == 'struct statx'
                 if have
@@ -533,6 +550,7 @@ foreach decl : ['char16_t',
 endforeach
 
 conf.set10('WANT_LINUX_STAT_H', want_linux_stat_h)
+conf.set10('WANT_LINUX_FS_H', want_linux_fs_h)
 
 foreach ident : ['secure_getenv', '__secure_getenv']
         conf.set10('HAVE_' + ident.to_upper(), cc.has_function(ident))
@@ -779,7 +797,7 @@ if default_net_naming_scheme != 'latest'
 endif
 
 time_epoch = get_option('time-epoch')
-if time_epoch == -1
+if time_epoch <= 0
         time_epoch = run_command(sh, '-c', 'echo "$SOURCE_DATE_EPOCH"', check : true).stdout().strip()
         if time_epoch == '' and git.found() and fs.exists('.git')
                 # If we're in a git repository, use the creation time of the latest git tag.
@@ -797,7 +815,7 @@ if time_epoch == -1
                 time_epoch = run_command(stat, '-c', '%Y', NEWS,
                                          check : true).stdout()
         endif
-        time_epoch = time_epoch.to_int()
+        time_epoch = time_epoch.strip().to_int()
 endif
 conf.set('TIME_EPOCH', time_epoch)
 
@@ -812,7 +830,7 @@ foreach tuple : [['system-alloc-uid-min', 'SYS_UID_MIN', 1],  # Also see login.d
                  ['system-alloc-gid-min', 'SYS_GID_MIN', 1],
                  ['system-gid-max',       'SYS_GID_MAX', 999]]
         v = get_option(tuple[0])
-        if v == -1
+        if v <= 0
                 v = run_command(
                         awk,
                         '/^\s*@0@\s+/ { uid=$2 } END { print uid }'.format(tuple[1]),
@@ -858,7 +876,7 @@ if not meson.is_cross_build()
         endif
         id_result = run_command('id', '-u', nobody_user, check : false)
         if id_result.returncode() == 0
-                id = id_result.stdout().to_int()
+                id = id_result.stdout().strip().to_int()
                 if id != 65534
                         warning('\n' +
                                 'The local user with the configured user name "@0@" of the nobody user does not have UID 65534 (it has @1@).\n'.format(nobody_user, id) +
@@ -877,7 +895,7 @@ if not meson.is_cross_build()
         endif
         id_result = run_command('id', '-g', nobody_group, check : false)
         if id_result.returncode() == 0
-                id = id_result.stdout().to_int()
+                id = id_result.stdout().strip().to_int()
                 if id != 65534
                         warning('\n' +
                                 'The local group with the configured group name "@0@" of the nobody group does not have GID 65534 (it has @1@).\n'.format(nobody_group, id) +
@@ -920,8 +938,8 @@ foreach option : ['adm-gid',
         val = get_option(option)
 
         # Ensure provided GID argument is numeric, otherwise fall back to default assignment
-        conf.set(name, val >= 0 ? val : '-')
-        if val >= 0
+        conf.set(name, val > 0 ? val : '-')
+        if val > 0
                 static_ugids += '@0@:@1@'.format(option, val)
         endif
 endforeach
@@ -1165,6 +1183,11 @@ have = get_option('smack') and get_option('smack-run-label') != ''
 conf.set10('HAVE_SMACK_RUN_LABEL', have)
 if have
         conf.set_quoted('SMACK_RUN_LABEL', get_option('smack-run-label'))
+endif
+
+have = get_option('smack') and get_option('smack-default-process-label') != ''
+if have
+        conf.set_quoted('SMACK_DEFAULT_PROCESS_LABEL', get_option('smack-default-process-label'))
 endif
 
 want_polkit = get_option('polkit')
@@ -2208,7 +2231,7 @@ exe = executable(
         dependencies : [versiondep,
                         libseccomp],
         install_rpath : rootpkglibdir,
-        install : conf.get('ENABLE_ANALYZE'))
+        install : conf.get('ENABLE_ANALYZE') == 1)
 public_programs += exe
 
 if want_tests != 'false'
@@ -2242,11 +2265,19 @@ public_programs += executable(
         install_rpath : rootpkglibdir,
         install : true)
 
+if get_option('link-journalctl-shared')
+        journalctl_link_with = [libshared]
+else
+        journalctl_link_with = [libsystemd_static,
+                                libshared_static,
+                                libbasic_gcrypt]
+endif
+
 public_programs += executable(
         'journalctl',
         journalctl_sources,
         include_directories : includes,
-        link_with : [libshared],
+        link_with : [journalctl_link_with],
         dependencies : [threads,
                         libdl,
                         libxz,
@@ -2292,6 +2323,10 @@ exe = executable(
         install_rpath : rootpkglibdir,
         install : true,
         install_dir : systemgeneratordir)
+
+meson.add_install_script(meson_make_symlink,
+                         systemgeneratordir / 'systemd-fstab-generator',
+                         rootlibexecdir / 'systemd-sysroot-fstab-check')
 
 if want_tests != 'false'
         test('test-fstab-generator',
@@ -2510,6 +2545,18 @@ if conf.get('HAVE_BLKID') == 1 and conf.get('HAVE_GNU_EFI') == 1
                 install_rpath : rootpkglibdir,
                 install : true,
                 install_dir : systemgeneratordir)
+
+        if conf.get('HAVE_OPENSSL') == 1
+                executable(
+                        'systemd-measure',
+                        'src/boot/measure.c',
+                        include_directories : includes,
+                        link_with : [libshared],
+                        dependencies : [libopenssl],
+                        install_rpath : rootpkglibdir,
+                        install : true,
+                        install_dir : rootlibexecdir)
+        endif
 endif
 
 executable(
@@ -3621,12 +3668,6 @@ if conf.get('ENABLE_REPART') == 1
                 install : true,
                 install_dir : rootbindir)
         public_programs += exe
-
-        if want_tests != 'false'
-                test('test-repart',
-                     test_repart_sh,
-                     args : [exe.full_path(), udevadm.full_path()])
-        endif
 endif
 
 executable(
@@ -3747,7 +3788,7 @@ executable(
         install : true,
         install_dir : rootlibexecdir)
 
-public_programs += custom_target(
+exe = custom_target(
         'kernel-install',
         input : kernel_install_in,
         output : 'kernel-install',
@@ -3755,6 +3796,13 @@ public_programs += custom_target(
         install : want_kernel_install,
         install_mode : 'rwxr-xr-x',
         install_dir : bindir)
+public_programs += exe
+
+if want_tests != 'false'
+        test('test-kernel-install',
+             test_kernel_install_sh,
+             args : [exe.full_path(), loaderentry_install])
+endif
 
 ############################################################
 
@@ -4260,7 +4308,7 @@ foreach tuple : [
         # components
         ['backlight'],
         ['binfmt'],
-        ['bpf-framework',         conf.get('BPF_FRAMEWORK') == 1],
+        ['bpf-framework',          conf.get('BPF_FRAMEWORK') == 1],
         ['coredump'],
         ['environment.d'],
         ['efi'],
@@ -4290,7 +4338,7 @@ foreach tuple : [
         ['resolve'],
         ['rfkill'],
         ['sysext'],
-        ['systemd-analyze',       conf.get('ENABLE_ANALYZE') == 1],
+        ['systemd-analyze',        conf.get('ENABLE_ANALYZE') == 1],
         ['sysupdate'],
         ['sysusers'],
         ['timedated'],
@@ -4304,36 +4352,37 @@ foreach tuple : [
         ['idn'],
         ['polkit'],
         ['nscd'],
-        ['legacy-pkla',           install_polkit_pkla],
+        ['legacy-pkla',            install_polkit_pkla],
         ['kmod'],
         ['dbus'],
         ['glib'],
         ['tpm'],
-        ['man pages',             want_man],
-        ['html pages',            want_html],
-        ['man page indices',      want_man and have_lxml],
+        ['man pages',              want_man],
+        ['html pages',             want_html],
+        ['man page indices',       want_man and have_lxml],
         ['SysV compat'],
         ['compat-mutable-uid-boundaries'],
         ['utmp'],
         ['ldconfig'],
-        ['adm group',             get_option('adm-group')],
-        ['wheel group',           get_option('wheel-group')],
+        ['adm group',              get_option('adm-group')],
+        ['wheel group',            get_option('wheel-group')],
         ['gshadow'],
         ['debug hashmap'],
         ['debug mmap cache'],
         ['debug siphash'],
-        ['valgrind',              conf.get('VALGRIND') == 1],
-        ['trace logging',         conf.get('LOG_TRACE') == 1],
-        ['install tests',         install_tests],
-        ['link-udev-shared',      get_option('link-udev-shared')],
-        ['link-systemctl-shared', get_option('link-systemctl-shared')],
-        ['link-networkd-shared',  get_option('link-networkd-shared')],
-        ['link-timesyncd-shared', get_option('link-timesyncd-shared')],
-        ['link-boot-shared',      get_option('link-boot-shared')],
+        ['valgrind',               conf.get('VALGRIND') == 1],
+        ['trace logging',          conf.get('LOG_TRACE') == 1],
+        ['install tests',          install_tests],
+        ['link-udev-shared',       get_option('link-udev-shared')],
+        ['link-systemctl-shared',  get_option('link-systemctl-shared')],
+        ['link-networkd-shared',   get_option('link-networkd-shared')],
+        ['link-timesyncd-shared',  get_option('link-timesyncd-shared')],
+        ['link-journalctl-shared', get_option('link-journalctl-shared')],
+        ['link-boot-shared',       get_option('link-boot-shared')],
         ['first-boot-full-preset'],
         ['fexecve'],
-        ['standalone-binaries',   get_option('standalone-binaries')],
-        ['coverage',              get_option('b_coverage')],
+        ['standalone-binaries',    get_option('standalone-binaries')],
+        ['coverage',               get_option('b_coverage')],
 ]
 
         if tuple.length() >= 2
